@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+message: "If you use kernelpack-jax, please cite this software and the relevant numerical-method paper."
+title: "kernelpack-jax"
+type: software
+authors:
+  - family-names: Shankar
+    given-names: Varun
+repository-code: "https://github.com/VarShankar/kernelpack-jax"
+url: "https://github.com/VarShankar/kernelpack-jax"
+license: BSD-3-Clause
+version: 0.1.0
+date-released: 2026-09-11
