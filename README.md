@@ -8,25 +8,13 @@
 **JAX-native meshfree geometry, RBF-FD, partition-of-unity methods, and PDE
 solvers.**
 
-`kernelpack-jax` provides differentiable, accelerator-ready implementations of
-the core KernelPack workflow: construct geometry, generate scattered nodes,
-assemble PHS+polynomial RBF-FD or weighted-least-squares operators, and solve
-PDEs on fixed domains, moving domains, and evolving surfaces.
-
-The moving-domain implementation accompanies the published method
-[*An efficient high-order meshless method for advection-diffusion equations on
-time-varying irregular domains*](https://doi.org/10.1016/j.jcp.2021.110633)
-by Varun Shankar, Grady B. Wright, and Aaron L. Fogelson. The package follows
-the same geometry and local-approximation conventions as
+`kernelpack-jax` is the accelerator-oriented member of the KernelPack family.
+It brings meshfree geometry, scattered-node generation, polynomial tools,
+RBF-FD, partition-of-unity approximation, and PDE solvers into a JAX codebase
+designed for transformation with `jit`, `vmap`, and automatic differentiation.
+Companion implementations are available in
 [`kernelpack-matlab`](https://github.com/VarShankar/kernelpack-matlab) and
-[`kernelpack-python`](https://github.com/VarShankar/kernelpack-python), while
-providing JAX transformations and optional Warp acceleration for its supported
-solver paths.
-
-The moving-surface implementation accompanies
-[*A high-order, meshless, Lagrangian--Eulerian RBF-FD method for
-advection--diffusion--reaction on moving manifolds*](https://arxiv.org/abs/2608.19384)
-by Matthew Lowery, Grady B. Wright, and Varun Shankar.
+[`kernelpack-python`](https://github.com/VarShankar/kernelpack-python).
 
 ![Geometry and a boundary-refined meshfree node cloud](docs/readme_assets/geometry_domain.png)
 
@@ -40,48 +28,54 @@ interior while retaining boundary and ghost-node structure.
 [Tests](#verification) | [Papers](#research-foundations) |
 [Citation](#citation)
 
-## Who this is for
+## What it includes
 
-This package is intended for numerical PDE researchers and JAX users who want
-to:
-
-- prototype PHS+poly RBF-FD or weighted-least-squares discretizations;
-- generate scattered nodes and differential operators on embedded domains;
-- solve elliptic and diffusion problems without constructing a volume mesh;
-- study advection--diffusion--reaction equations on domains with moving
-  embedded boundaries;
-- solve conservative transport and reaction--diffusion problems on evolving
-  closed surfaces; or
-- differentiate fixed-discretization PDE solves with respect to continuous
-  coefficients, source terms, boundary data, and initial conditions.
-
-It is a research codebase rather than a general-purpose finite-element package.
-Node generation and neighborhood selection are discrete preprocessing steps;
-the fixed stencil algebra and supported solver kernels are JAX computations.
-
-## At a glance
-
-| Component | What the public release provides |
-| --- | --- |
-| Geometry models | Smooth and piecewise-smooth embedded boundaries, RBF level sets, parametric SBF fits, and cached moving-boundary SBF models |
-| Node generation | Seeded fixed- and variable-radius Poisson sampling, level-set clipping, boundary and ghost nodes, boundary-zone refinement, and dual node sets |
-| Local approximation | Legendre polynomial bases, standard and overlapped PHS+poly RBF-FD, weighted least squares, and divergence-free PHS interpolation |
-| Fixed-domain solvers | Poisson, variable and nonlinear variable-coefficient Poisson, BDF1--BDF3 diffusion, localized PU diffusion, and multispecies PU diffusion |
-| Moving-domain ADR | Semi-Lagrangian BDF1--BDF3 transport, RK3 boundary motion, cached SBF reconstruction, carve/refill updates, selective RBF-FD updates, and implicit diffusion--reaction solves in two and three dimensions |
-| Moving-surface ADR | Lagrangian--Eulerian BDF1--BDF3 stepping, tangent-plane RBF-FD, cached-factor defect updates, adaptive surface hyperviscosity, SBF geometry and normals, conservative quadrature projection, and semi-Lagrangian history backfill |
-| Geometric surface evolution | Explicit or matrix-free semi-implicit tangent-plane RBF-FD mean-curvature-flow steps |
-| Acceleration | JIT-compiled and `vmap`-batched local systems and solves, device-side `lax.scan`/`lax.cond` updates, sparse COO operators, and optional Warp hash-grid sampling and neighbor searches |
+- Geometry models for smooth and piecewise-smooth embedded boundaries and
+  surfaces, including RBF level sets and parametric SBF representations
+- Seeded fixed- and variable-radius Poisson node generation, geometry-aware
+  clipping, boundary refinement, ghost nodes, and dual node sets
+- Shared Legendre polynomial and multi-index utilities
+- Standard and overlapped PHS+poly RBF-FD, weighted least squares, localized
+  partition-of-unity approximation, and divergence-free interpolation
+- Fixed-domain Poisson, variable and nonlinear variable-coefficient Poisson,
+  BDF diffusion, localized PU diffusion, and multispecies diffusion solvers
+- Semi-Lagrangian BDF1--BDF3 advection--diffusion--reaction on domains with
+  moving embedded boundaries in two and three dimensions
+- Tangent-plane RBF-FD operators for stationary and moving surfaces, including
+  defect-corrected updates, hyperviscosity, quadrature, mass projection,
+  marker rearrangement, and history backfill
+- Mean-curvature flow and transport on externally generated material
+  trajectories
+- JIT-compiled and `vmap`-batched kernels, sparse JAX operators, and optional
+  Warp acceleration for spatial searches and node generation
 
 The main namespaces are `kernelpack.geometry`, `kernelpack.nodes`,
 `kernelpack.domain`, `kernelpack.manifold`, `kernelpack.poly`, `kernelpack.rbffd`,
 `kernelpack.divfree`, `kernelpack.accelerators`, and `kernelpack.solvers`.
 
+## Supported workflows
+
+- Smooth and piecewise-smooth embedded geometry in two and three dimensions
+- Fixed- and variable-density Poisson sampling and level-set clipping
+- Standard, overlapped, weighted-least-squares, and PU local approximation
+- Fixed-domain elliptic, diffusion, and multispecies diffusion problems
+- Moving-domain advection--diffusion--reaction with embedded boundaries
+- Conservative transport and reaction--diffusion on stationary or evolving
+  closed surfaces
+- Geometric surface evolution, marker-quality monitoring, rearrangement, and
+  semi-Lagrangian BDF-history reconstruction
+- Fixed-discretization differentiation with respect to continuous
+  coefficients, forcing, boundary data, and initial conditions
+
+## Execution model
+
 KernelPack keeps topology-changing setup explicit: node generation,
-active-set changes, and neighbor selection may change array shapes or integer
-connectivity. Once those structures are fixed, local assembly, operator
-application, geometry updates, time stepping, and iterative solves remain in
-JAX and can be transformed with `jit` or `vmap`. The package enables 64-bit
-mode because high-order augmented RBF-FD systems require double precision.
+active-set changes, file I/O, and neighbor selection may change array shapes
+or integer connectivity. Once those structures are fixed, local assembly,
+operator application, geometry updates, adaptive stabilization, time stepping,
+and iterative solves remain on the active JAX device and can be transformed
+with `jit` or `vmap`. The package enables 64-bit mode because high-order
+augmented RBF-FD systems require double precision.
 
 ## Requirements
 
@@ -262,8 +256,8 @@ python examples/surface_rearrangement_example.py
 ```
 
 The three-dimensional red-blood-cell example replays the public IBAMR
-trajectory used by the moving-surface paper. The downloader verifies the
-release archive before installing the trajectory locally; the solver then
+trajectory distributed in the shared data release. The downloader verifies
+the archive before installing the trajectory locally; the solver then
 reconstructs SBF geometry and normals, advances a source-free diffusing tracer
 with the same tangent-plane ADR machinery, enforces the quadrature mass law,
 and writes the final point cloud and concentration to `artifacts/`.
@@ -351,20 +345,9 @@ your work.
 
 ## Citation
 
-Software citation metadata are provided in [`CITATION.cff`](CITATION.cff). If
-you use the moving-domain solver, please also cite:
-
-> Varun Shankar, Grady B. Wright, and Aaron L. Fogelson. "An efficient
-> high-order meshless method for advection-diffusion equations on time-varying
-> irregular domains." Journal of Computational Physics 445, 110633, 2021.
-> [doi:10.1016/j.jcp.2021.110633](https://doi.org/10.1016/j.jcp.2021.110633)
-
-If you use the moving-surface kernels, please also cite:
-
-> Matthew Lowery, Grady B. Wright, and Varun Shankar. "A high-order,
-> meshless, Lagrangian--Eulerian RBF-FD method for
-> advection--diffusion--reaction on moving manifolds." arXiv:2608.19384,
-> 2026. [doi:10.48550/arXiv.2608.19384](https://doi.org/10.48550/arXiv.2608.19384)
+Software citation metadata are provided in [`CITATION.cff`](CITATION.cff).
+Please also cite the method papers corresponding to the components used in
+your work.
 
 ## Contributing
 
