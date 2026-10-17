@@ -26,7 +26,40 @@ matrix-free operators, and optional Warp spatial primitives.
 [Approach](#the-kernelpack-approach) | [Capabilities](#numerical-stack) |
 [Install](#installation) | [Quick start](#quick-start) |
 [Workflows](#core-workflows) | [Examples](#examples) |
-[Verification](#verification) | [Papers](#research-foundations)
+[Verification](#verification) | [Papers](#research-foundations) |
+[Citing](#citing)
+
+## Citing
+
+If you use the node generation, the stacked boundary representation, or the
+differentiable GPU solvers in `kernelpack-jax`, please cite the KernelPack-JAX
+paper and the node generation paper it builds on:
+
+```bibtex
+@unpublished{cattaneo2026kernelpackjax,
+  author = {Cattaneo, Alberto and Ballard, M. Keith and Kirby, Robert M. and
+            Wright, Grady B. and Shankar, Varun},
+  title  = {{KernelPack-JAX}: a meshless differentiable {GPU} framework for
+            node generation and forward and inverse {PDE} problems},
+  note   = {Submitted to Journal of Computational Physics},
+  year   = {2026}
+}
+
+@article{shankar2018robust,
+  author  = {Shankar, Varun and Kirby, Robert M. and Fogelson, Aaron L.},
+  title   = {Robust Node Generation for Mesh-free Discretizations on Irregular
+             Domains and Surfaces},
+  journal = {SIAM Journal on Scientific Computing},
+  volume  = {40},
+  number  = {4},
+  pages   = {A2584--A2608},
+  year    = {2018},
+  doi     = {10.1137/17M114090X}
+}
+```
+
+Papers for the other components are listed under
+[Research foundations](#research-foundations).
 
 ## The KernelPack approach
 
@@ -307,6 +340,7 @@ correspond to the components used in your work.
 | Bulk hyperviscosity and PHS-degree selection | V. Shankar and A. L. Fogelson, [*Hyperviscosity-based stabilization for radial basis function-finite difference (RBF-FD) discretizations of advection-diffusion equations*](https://doi.org/10.1016/j.jcp.2018.06.036), Journal of Computational Physics 372 (2018), 616--639 |
 | Surface hyperviscosity | V. Shankar, G. B. Wright, and A. Narayan, [*A robust hyperviscosity formulation for stable RBF-FD discretizations of advection-diffusion-reaction equations on manifolds*](https://doi.org/10.1137/19M1288747), SIAM Journal on Scientific Computing 42 (2020), A2371--A2401 |
 | Moving-domain ADR and matrix updates | V. Shankar, G. B. Wright, and A. L. Fogelson, [*An efficient high-order meshless method for advection-diffusion equations on time-varying irregular domains*](https://doi.org/10.1016/j.jcp.2021.110633), Journal of Computational Physics 445 (2021), 110633 |
+| Stacked boundary representation, GPU node generation, and differentiable GPU solvers | A. Cattaneo, M. K. Ballard, R. M. Kirby, G. B. Wright, and V. Shankar, *KernelPack-JAX: a meshless differentiable GPU framework for node generation and forward and inverse PDE problems*, submitted to Journal of Computational Physics (2026) |
 | Lagrangian-Eulerian moving-surface ADR | M. Lowery, G. B. Wright, and V. Shankar, [*A high-order, meshless, Lagrangian--Eulerian RBF-FD method for advection--diffusion--reaction on moving manifolds*](https://doi.org/10.48550/arXiv.2608.19384), arXiv:2608.19384 (2026) |
 
 ## GPU sparse direct solves
