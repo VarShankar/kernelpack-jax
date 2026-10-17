@@ -51,6 +51,7 @@ LM_BUDGET = {"max_steps": MAX_LM_STEPS}   # set from --max-lm-steps
 TRANSPORT_NU = .05
 TRANSPORT_FAMILIES = ("smooth", "c1")
 HV_ROW_MASK = {"mask": "boundary"}     # set from --hyperviscosity-rows
+SAVE_STATES = None                     # set from --save-states (ADR solution plots)
 
 
 def run_lm(residual, theta0, max_steps=MAX_LM_STEPS):
@@ -416,6 +417,17 @@ def adr_group(domain, geometry, order, families, dt_factor, cfl_factor=None, war
             out.update(dt=dt, steps=steps, hyperviscosity_power=int(solver.hyperviscosity_power),
                        gamma=np.asarray(gamma).tolist(), gamma_status=gamma_status,
                        max_speed=float(jnp.max(jnp.linalg.norm(v_true, axis=1))))
+            if SAVE_STATES is not None:
+                # Solution plots: computed final states with the true and the recovered parameters.
+                theta_fit = jnp.asarray(out["fit_theta"])
+                SAVE_STATES.mkdir(parents=True, exist_ok=True)
+                np.savez(SAVE_STATES / f"adr_{geometry}_h{h:.2f}_p{order}_{family}.npz",
+                         x=np.asarray(x), exact=np.asarray(target), velocity=np.asarray(v_true),
+                         u_true_params=np.asarray(residual(theta_star) * norm + target),
+                         u_fit_params=np.asarray(residual(theta_fit) * norm + target),
+                         reaction_true=np.asarray(reaction_of(theta_star, target, x)),
+                         reaction_fit=np.asarray(reaction_of(theta_fit, target, x)),
+                         theta_true=np.asarray(theta_star), theta_fit=np.asarray(theta_fit), h=h, order=order)
             yield family, out
     finally:
         solver.close_cudss()
@@ -481,7 +493,11 @@ def main():
     p.add_argument("--fit-resolution", type=int, default=41)
     p.add_argument("--cfpu-max-sites", type=int, default=512)
     p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--save-states", type=Path, default=None,
+                   help="ADR only: save the computed final states and reaction fields (solution plots) here.")
     a = p.parse_args()
+    global SAVE_STATES
+    SAVE_STATES = a.save_states
     assert jax.default_backend() == "gpu"
     families = a.families or {"darcy": list(darcy.FAMILIES), "rd": list(rd.FAMILIES), "transport": list(TRANSPORT_FAMILIES), "adr": list(rd.FAMILIES)}[a.problem]
     dt_factor = a.dt_factor or {"rd": .25, "transport": .0625, "adr": .0625}.get(a.problem)

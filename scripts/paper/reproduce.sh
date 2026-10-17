@@ -53,11 +53,12 @@ geometry)    # convergence of the parametric and implicit layers (Figure: geomet
 stats)       # parallel-algorithm and stencil-crossing statistics (Sections 6.1, 6.2), velocity fields
   run $PY scripts/paper_node_stats.py $C $C/node_stats.json
   run $PY scripts/paper_stencil_stats.py $C $C/stencil_stats.jsonl
-  run $PY scripts/paper_velocity_fields.py ;;
+  run $PY scripts/paper_velocity_fields.py
+  run $PY scripts/paper_obstacle_solution_fields.py ;;
 figures)     # tables (KernelPackJaxPaper/gen_*.tex), plot data, and the matplotlib node renderings
   run $PY scripts/paper_figures.py
   run $PY scripts/paper_chest_nodes_figure.py 0.08
   run $PY scripts/paper_obstacle_nodes_figure.py 0.04
-  echo "Now run scripts/matlab/paper_plots.m in MATLAB to draw KernelPackJaxPaper/Images/plots/*.pdf." ;;
+  echo "Now run scripts/matlab/paper_plots.m and scripts/matlab/obstacle_solution_plots.m in MATLAB to draw KernelPackJaxPaper/Images/plots/*.pdf." ;;
 *) echo "unknown stage $stage"; exit 2 ;;
 esac; done
