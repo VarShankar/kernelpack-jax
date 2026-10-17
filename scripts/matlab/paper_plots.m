@@ -16,6 +16,7 @@ D = jsondecode(fileread(fullfile(root, 'Outputs_and_results', 'paper_figures', '
 out = fullfile(root, 'KernelPackJaxPaper', 'Images', 'plots');
 if ~exist(out, 'dir'), mkdir(out); end
 if nargin > 0 && strcmp(only, 'velocity'), velocity(D.velocity, out); return; end
+if nargin > 0 && strcmp(only, 'legends'), convergence_legend(out); inverse_timings_legend(out); return; end
 convergence(D.forward, 'forward', out);
 convergence(D.inverse, 'inverse', out);
 convergence_legend(out);
@@ -97,7 +98,7 @@ end
 
 function legend_only(handles_fn, names, file, ncol)
 S = style();
-fig = figure('Units', 'centimeters', 'Position', [2 2 2*S.width 1.2], 'Color', 'w');
+fig = figure('Units', 'centimeters', 'Position', [2 2 3*S.width 1.2], 'Color', 'w');   % wide enough for six entries; export_fig crops
 ax = axes(fig); hold(ax, 'on'); axis(ax, 'off');
 h = handles_fn(ax);
 lg = legend(ax, h, names, 'Interpreter', 'latex', 'FontSize', S.font, 'Orientation', 'horizontal', ...
@@ -190,6 +191,11 @@ for k = 1:3
     ylabel(ax, 'time per inverse solve (s)', 'Interpreter', 'latex', 'FontSize', S.font+1);
     finish(ax, fig, fullfile(out, ['inverse_timings_' probs{k}]));
 end
+inverse_timings_legend(out);
+end
+
+function inverse_timings_legend(out)
+S = style();
     function h = mk(ax)
         h = gobjects(0);
         for p = [2 4 6]
