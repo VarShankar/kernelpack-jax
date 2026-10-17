@@ -18,6 +18,8 @@ from .core import (
     wrap_periodic_parameter,
 )
 from .moving import MovingBoundarySBFModel
+from .parametric_pu import PUOptions, ParametricSurfaceData, fit_parametric_pu, parameterize_surface_piece
+from .cfpu import CFPUOptions,CFPUModel,build_cfpu
 
 __all__ = [
     "EmbeddedSurface",
@@ -38,4 +40,11 @@ __all__ = [
     "weighted_sample_elimination_mis",
     "wrap_periodic_parameter",
     "MovingBoundarySBFModel",
+    "PUOptions",
+    "ParametricSurfaceData",
+    "fit_parametric_pu",
+    "parameterize_surface_piece",
+    "CFPUOptions",
+    "CFPUModel",
+    "build_cfpu",
 ]

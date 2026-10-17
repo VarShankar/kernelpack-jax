@@ -650,9 +650,10 @@ def warp_assembled_boundary_keep_mask(points: np.ndarray, corner_flags: np.ndarr
         return np.ones(pts.shape[0], dtype=bool)
 
     dim = int(pts.shape[1])
+    order = np.argsort(-corners, kind="stable")
+    pts, corners = pts[order], corners[order]
     p3 = _pad_to_vec3(pts)
     spacing_radius = float(radius) * (1.0 - 1.0e-12)
-    duplicate_radius = 0.2 * float(radius)
     grid_radius = max(float(radius), np.finfo(np.float32).eps)
     sample_min = np.min(p3, axis=0) - grid_radius
     sample_max = np.max(p3, axis=0) + grid_radius
@@ -665,19 +666,15 @@ def warp_assembled_boundary_keep_mask(points: np.ndarray, corner_flags: np.ndarr
     grid.build(wp_points, grid_radius)
 
     wp.launch(
-        _assembled_boundary_duplicate_keep_kernel,
-        dim=1,
-        inputs=[wp_points, grid.id, duplicate_radius, dim, int(pts.shape[0]), keep_wp],
-        device=cfg.device,
-    )
-    wp.launch(
         _assembled_boundary_spacing_keep_kernel,
         dim=1,
         inputs=[wp_points, wp_corners, grid.id, spacing_radius, dim, int(pts.shape[0]), keep_wp],
         device=cfg.device,
     )
     wp.synchronize_device(cfg.device)
-    return np.asarray(keep_wp.numpy(), dtype=np.int32).astype(bool)
+    result = np.zeros(len(pts), dtype=bool)
+    result[order] = np.asarray(keep_wp.numpy(), dtype=np.int32).astype(bool)
+    return result
 
 
 def warp_nearest_neighbor_distances(query_points: np.ndarray, points: np.ndarray) -> np.ndarray:

@@ -299,7 +299,7 @@ def _local_operator_weights(
         b = stencil.bc_op(sp, op, neu_coeff, dir_coeff, r, xq[None, :], xloc, xc[None, :], stencil.xc, normal[None, :])
     else:
         raise ValueError(f"unknown PU operator {op_name}")
-    w = stencil.stable_solve(stencil.solve_lhs, b)
+    w = stencil.stable_solve(stencil.solve_lhs, b, stencil.n)
     return w[: xloc.shape[0], 0]
 
 

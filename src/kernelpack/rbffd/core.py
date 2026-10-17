@@ -5,7 +5,7 @@ from functools import lru_cache, partial
 from math import ceil
 from typing import Callable
 
-from jax import jit, vmap
+from jax import jit, vmap, lax, custom_jvp, jvp
 from jax import scipy as jsp
 import jax.numpy as jnp
 
@@ -33,6 +33,96 @@ def _stable_solve(a: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarray:
     return jnp.linalg.solve(a, b)
 
 
+@jit
+def _cpqr_column_order(p: jnp.ndarray) -> jnp.ndarray:
+    """Householder column-pivot selection entirely on the current device.
+
+    JAX's stock pivoted QR defaults to host LAPACK for these small matrices.
+    We select the pivots with device Householder updates, then use the GPU
+    unpivoted QR implementation on the permuted matrix for Q and R.
+    """
+    m,q=p.shape
+    rows=jnp.arange(m);columns=jnp.arange(q)
+    def step(k,state):
+        work,permutation=state
+        norms=jnp.sum(jnp.where((rows>=k)[:,None],work*work,0.),axis=0)
+        pivot=jnp.argmax(jnp.where(columns>=k,norms,-1.))
+        old=work[:,k];chosen=work[:,pivot]
+        work=work.at[:,k].set(chosen).at[:,pivot].set(old)
+        old_index=permutation[k];chosen_index=permutation[pivot]
+        permutation=permutation.at[k].set(chosen_index).at[pivot].set(old_index)
+        column=jnp.where(rows>=k,work[:,k],0.)
+        alpha=-jnp.copysign(jnp.linalg.norm(column),column[k])
+        vector=column.at[k].add(-alpha)
+        square=jnp.dot(vector,vector)
+        beta=jnp.where(square>0,2./jnp.where(square>0,square,1.),0.)
+        work=work-beta*vector[:,None]*(vector@work)[None,:]
+        work=work.at[:,k].set(jnp.where(rows==k,alpha,jnp.where(rows>k,0.,work[:,k])))
+        return work,permutation
+    return lax.fori_loop(0,q,step,(p,jnp.arange(q)))[1]
+
+
+@jit
+def _polynomial_cpqr(p: jnp.ndarray):
+    """Reduced P[..., permutation] = Q R, with no host QR callback."""
+    shape=p.shape
+    flat=p.reshape(-1,shape[-2],shape[-1])
+    permutation=vmap(_cpqr_column_order)(flat)
+    permuted=jnp.take_along_axis(flat,permutation[:,None,:],axis=-1)
+    q,r=jnp.linalg.qr(permuted,mode="reduced")
+    return q.reshape(shape),r.reshape(*shape[:-2],shape[-1],shape[-1]),permutation.reshape(*shape[:-2],shape[-1])
+
+
+@partial(jit,static_argnames=("npoints",))
+def _polynomial_rcond(a: jnp.ndarray,npoints: int):
+    p=a[...,:npoints,npoints:]
+    _,r=jnp.linalg.qr(p,mode="reduced")
+    inverse=jsp.linalg.solve_triangular(r,jnp.broadcast_to(jnp.eye(r.shape[-1],dtype=r.dtype),r.shape),lower=False)
+    product=jnp.linalg.norm(r,ord=jnp.inf,axis=(-2,-1))*jnp.linalg.norm(inverse,ord=jnp.inf,axis=(-2,-1))
+    return jnp.where(jnp.isfinite(product)&(product>0),1./product,0.)
+
+
+@partial(jit,static_argnames=("npoints","force_cpqr"))
+def _solve_rbf_augmented(a: jnp.ndarray,b: jnp.ndarray,npoints: int,force_cpqr: bool=False):
+    """CPQR fallback that preserves the original polynomial moment equations.
+
+    If P Pi = Q R, the new lower RHS is R^{-T} Pi^T d, not d.
+    Convert the multipliers back as well. A numerically rank-deficient P
+    cannot support the requested polynomial space and is explicitly refused;
+    this routine never silently lowers the requested polynomial degree.
+    """
+    vector=b.ndim==a.ndim-1
+    rhs=b[...,None] if vector else b
+    npoly=a.shape[-1]-npoints
+    if npoly<=0:
+        result=jnp.linalg.solve(a,rhs)
+        return result[...,0] if vector else result
+    if npoints<npoly:
+        result=jnp.full_like(rhs,jnp.nan)
+        return result[...,0] if vector else result
+    rcond=_polynomial_rcond(a,npoints)
+    ordinary=jnp.linalg.solve(a,rhs)
+    trigger=(rcond<jnp.sqrt(jnp.finfo(a.dtype).eps))|(~jnp.all(jnp.isfinite(ordinary),axis=(-2,-1)))|force_cpqr
+    def fallback(_):
+        p=a[...,:npoints,npoints:]
+        q,r,permutation=_polynomial_cpqr(p)
+        diagonal=jnp.abs(jnp.diagonal(r,axis1=-2,axis2=-1))
+        rank_ok=jnp.all(diagonal>max(npoints,npoly)*jnp.finfo(a.dtype).eps*diagonal[...,:1],axis=-1)
+        safe_r=jnp.where(rank_ok[...,None,None],r,jnp.eye(npoly,dtype=r.dtype))
+        d=jnp.take_along_axis(rhs[...,npoints:,:],permutation[..., :,None],axis=-2)
+        transformed=jsp.linalg.solve_triangular(jnp.swapaxes(safe_r,-1,-2),d,lower=True)
+        system=a.at[...,:npoints,npoints:].set(q).at[...,npoints:,:npoints].set(jnp.swapaxes(q,-1,-2))
+        new_rhs=jnp.concatenate((rhs[...,:npoints,:],transformed),axis=-2)
+        solved=jnp.linalg.solve(system,new_rhs)
+        multipliers=jsp.linalg.solve_triangular(safe_r,solved[...,npoints:,:],lower=False)
+        multipliers=jnp.take_along_axis(multipliers,jnp.argsort(permutation,axis=-1)[..., :,None],axis=-2)
+        solved=jnp.concatenate((solved[...,:npoints,:],multipliers),axis=-2)
+        solved=jnp.where(rank_ok[...,None,None],solved,jnp.nan)
+        return jnp.where(trigger[...,None,None],solved,ordinary)
+    result=lax.cond(jnp.any(trigger),fallback,lambda _:ordinary,operand=None)
+    return result[...,0] if vector else result
+
+
 def _build_legendre_basis(dim: int, ell: int) -> PolynomialBasis:
     return PolynomialBasis.from_total_degree(dim, ell, family="legendre", center=jnp.zeros(dim), scale=1.0)
 
@@ -46,7 +136,12 @@ def _build_legendre_basis_data(dim: int, ell: int) -> tuple[jnp.ndarray, jnp.nda
 @jit
 def _batched_pairwise_distances(x_stencils: jnp.ndarray) -> jnp.ndarray:
     diff = x_stencils[:, :, None, :] - x_stencils[:, None, :, :]
-    return jnp.linalg.norm(diff, axis=3)
+    diagonal = jnp.eye(x_stencils.shape[1], dtype=bool)[None, :, :]
+    # Self distances are identically zero. Do not differentiate norm(0),
+    # whose undefined derivative otherwise contaminates zero tangents.
+    unit = jnp.zeros(x_stencils.shape[2], dtype=x_stencils.dtype).at[0].set(1.)
+    safe = jnp.where(diagonal[..., None], unit, diff)
+    return jnp.where(diagonal, 0., jnp.linalg.norm(safe, axis=3))
 
 
 @jit
@@ -76,7 +171,9 @@ def _prepare_rbf_system(
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     dim = x_stencils.shape[2]
     r = _batched_pairwise_distances(x_stencils)
-    width = jnp.maximum(r.max(axis=(1, 2)), 1.0)
+    # Scale by the stencil diameter (no floor at 1): the polynomial block must
+    # be evaluated on O(1) coordinates or its conditioning degrades like diam^ell.
+    width = jnp.maximum(r.max(axis=(1, 2)), jnp.finfo(x_stencils.dtype).tiny)
     xm = x_stencils.mean(axis=1)
     xc = (x_stencils - xm[:, None, :]) / width[:, None, None]
     p = _batched_basis_eval(index_set, recurrence_a, recurrence_b, xc, jnp.zeros((1, dim), dtype=int))
@@ -114,7 +211,7 @@ def _batched_rbf_lap_weights(
         [jnp.swapaxes(RBFStencil.phs_lap(r[:, :1, :], spline_degree, dim), 1, 2), rhs_poly],
         axis=1,
     )
-    return jnp.linalg.solve(lhs, rhs)[:, : x_stencils.shape[1], :]
+    return _solve_rbf_augmented(lhs, rhs, x_stencils.shape[1])[:, : x_stencils.shape[1], :]
 
 
 @partial(jit, static_argnames=("spline_degree",))
@@ -135,7 +232,7 @@ def _batched_rbf_interp_weights(
         jnp.zeros((1, dim), dtype=int),
     ).transpose(0, 2, 1)
     rhs = jnp.concatenate([jnp.swapaxes(RBFStencil.phs_rbf(r[:, :1, :], spline_degree), 1, 2), rhs_poly], axis=1)
-    return jnp.linalg.solve(lhs, rhs)[:, : x_stencils.shape[1], :]
+    return _solve_rbf_augmented(lhs, rhs, x_stencils.shape[1])[:, : x_stencils.shape[1], :]
 
 
 @partial(jit, static_argnames=("spline_degree", "selectdim"))
@@ -159,7 +256,7 @@ def _batched_rbf_grad_weights(
     ).transpose(0, 2, 1) / width[:, None, None]
     rhs_rbf = (diff[:, None, :] * RBFStencil.phs_dr_over_r(r[:, :1, :], spline_degree)).swapaxes(1, 2)
     rhs = jnp.concatenate([rhs_rbf, rhs_poly], axis=1)
-    return jnp.linalg.solve(lhs, rhs)[:, : x_stencils.shape[1], :]
+    return _solve_rbf_augmented(lhs, rhs, x_stencils.shape[1])[:, : x_stencils.shape[1], :]
 
 
 @partial(jit, static_argnames=("spline_degree", "selectdim"))
@@ -189,7 +286,7 @@ def _batched_rbf_grad_weights_at_points(
         [(diff * RBFStencil.phs_dr_over_r(r_rhs, spline_degree))[:, :, None], rhs_poly],
         axis=1,
     )
-    return jnp.linalg.solve(lhs, rhs)[:, : x_stencils.shape[1], :]
+    return _solve_rbf_augmented(lhs, rhs, x_stencils.shape[1])[:, : x_stencils.shape[1], :]
 
 
 @partial(jit, static_argnames=("spline_degree",))
@@ -214,7 +311,7 @@ def _batched_rbf_interp_weights_at_points(
         jnp.zeros((1, dim), dtype=int),
     ).transpose(0, 2, 1)
     rhs = jnp.concatenate([RBFStencil.phs_rbf(r_rhs, spline_degree)[:, :, None], rhs_poly], axis=1)
-    return jnp.linalg.solve(lhs, rhs)[:, : x_stencils.shape[1], :]
+    return _solve_rbf_augmented(lhs, rhs, x_stencils.shape[1])[:, : x_stencils.shape[1], :]
 
 
 @partial(jit, static_argnames=("spline_degree",))
@@ -287,6 +384,41 @@ def _batched_rbf_bc_weights(
     neu_coeff: jnp.ndarray,
     dir_coeff: jnp.ndarray,
 ) -> jnp.ndarray:
+    return _nodal_boundary_evaluation(x_stencils, index_set, recurrence_a,
+        recurrence_b, spline_degree, normals, neu_coeff, dir_coeff)
+
+
+@partial(custom_jvp, nondiff_argnums=(4,))
+def _nodal_boundary_evaluation(x_stencils, index_set, recurrence_a,
+        recurrence_b, spline_degree, normals, neu_coeff, dir_coeff):
+    nodal = jnp.zeros(x_stencils.shape[:2] + (1,), dtype=x_stencils.dtype)
+    nodal = nodal.at[:, 0, 0].set(dir_coeff)
+    return lax.cond(
+        jnp.all(neu_coeff == 0),
+        lambda _: nodal,
+        lambda _: _batched_rbf_neumann_weights(x_stencils, index_set, recurrence_a,
+            recurrence_b, spline_degree, normals, neu_coeff) + nodal,
+        None,
+    )
+
+
+@_nodal_boundary_evaluation.defjvp
+def _nodal_boundary_jvp(spline_degree, primals, tangents):
+    x, indices, ra, rb, normals, neu, dire = primals
+    value = _nodal_boundary_evaluation(x, indices, ra, rb, spline_degree, normals, neu, dire)
+    def full_evaluation(x, indices, ra, rb, normals, neu, dire):
+        nodal = jnp.zeros(x.shape[:2] + (1,), dtype=x.dtype).at[:, 0, 0].set(dire)
+        return _batched_rbf_neumann_weights(x, indices, ra, rb, spline_degree, normals, neu) + nodal
+    # A pure Dirichlet primal can skip its solve, but the derivative with
+    # respect to a Neumann coefficient at zero still needs that functional.
+    _, tangent = jvp(full_evaluation, primals, tangents)
+    return value, tangent
+
+
+@partial(jit, static_argnames=("spline_degree",))
+def _batched_rbf_neumann_weights(
+    x_stencils, index_set, recurrence_a, recurrence_b, spline_degree, normals, neu_coeff,
+):
     dim = x_stencils.shape[2]
     lhs, width, xc, r = _prepare_rbf_system(x_stencils, index_set, recurrence_a, recurrence_b, spline_degree)
     grad_poly = _batched_basis_eval(
@@ -300,16 +432,25 @@ def _batched_rbf_bc_weights(
     grad_rbf = RBFStencil.phs_dr_over_r(r[:, :1, :], spline_degree)[..., None] * diff
     total_rbf = neu_coeff[:, None, None] * jnp.sum(jnp.swapaxes(grad_rbf, 1, 2) * normals[:, None, None, :], axis=3)
     total_poly = neu_coeff[:, None, None] * jnp.sum(grad_poly[:, 0, :, :] * normals[:, None, :], axis=2)[:, :, None]
-    total_rbf = total_rbf + dir_coeff[:, None, None] * jnp.swapaxes(RBFStencil.phs_rbf(r[:, :1, :], spline_degree), 1, 2)
-    total_poly = total_poly + dir_coeff[:, None, None] * _batched_basis_eval(
-        index_set,
-        recurrence_a,
-        recurrence_b,
-        xc[:, :1, :],
-        jnp.zeros((1, dim), dtype=int),
-    ).transpose(0, 2, 1)
     rhs = jnp.concatenate([total_rbf, total_poly], axis=1)
-    return jnp.linalg.solve(lhs, rhs)[:, : x_stencils.shape[1], :]
+    return _solve_rbf_augmented(lhs, rhs, x_stencils.shape[1])[:, : x_stencils.shape[1], :]
+
+
+@partial(jit, static_argnames=("spline_degree", "power"))
+def _batched_rbf_lap_power_weights(x_stencils, index_set, recurrence_a,
+                                  recurrence_b, spline_degree, power):
+    """Delta^power with polynomial degree below 2*power, in one device batch."""
+    lhs, _, _, r = _prepare_rbf_system(x_stencils, index_set, recurrence_a,
+                                      recurrence_b, spline_degree)
+    dim = x_stencils.shape[2]
+    coefficient = 1.
+    for s in range(power):
+        coefficient *= (spline_degree - 2*s) * (spline_degree + dim - 2 - 2*s)
+    radial = coefficient * r[:, :1, :] ** (spline_degree - 2*power)
+    radial = jnp.where(jnp.isfinite(radial), radial, 0.)
+    rhs = jnp.concatenate((jnp.swapaxes(radial, 1, 2),
+        jnp.zeros((x_stencils.shape[0], index_set.shape[0], 1), dtype=radial.dtype)), axis=1)
+    return _solve_rbf_augmented(lhs, rhs, x_stencils.shape[1])[:, :x_stencils.shape[1], :]
 
 
 @jit
@@ -322,7 +463,7 @@ def _prepare_wls_system(
     dim = x_stencils.shape[2]
     xm = x_stencils[:, :1, :]
     r2 = jnp.sum((x_stencils - xm) ** 2, axis=2)
-    width = jnp.maximum(jnp.sqrt(r2.max(axis=1)), 1.0)
+    width = jnp.maximum(jnp.sqrt(r2.max(axis=1)), jnp.finfo(x_stencils.dtype).tiny)  # stencil radius; no floor at 1
     xc = (x_stencils - xm) / width[:, None, None]
     p = _batched_basis_eval(index_set, recurrence_a, recurrence_b, xc, jnp.zeros((1, dim), dtype=int))
     node_weights = jnp.clip(jnp.exp(-4.0 * r2 / (width[:, None] ** 2)), 1e-10, 1.0)
@@ -513,6 +654,12 @@ def _batched_rbf_weights(
 ) -> jnp.ndarray:
     dim = x_stencils.shape[2]
     index_set, recurrence_a, recurrence_b = _build_legendre_basis_data(dim, sp.ell)
+    power = getattr(op_name, "_kernelpack_laplacian_power", None)
+    if power is not None:
+        if not (power > 0 and sp.ell < 2*power and sp.spline_degree % 2 == 1):
+            raise ValueError("batched Laplacian power requires odd PHS and polynomial degree below 2*power")
+        return _batched_rbf_lap_power_weights(x_stencils, index_set, recurrence_a,
+            recurrence_b, sp.spline_degree, power)
     name = _canonical_op_name(op_name)
     if name == "lap":
         return _batched_rbf_lap_weights(x_stencils, index_set, recurrence_a, recurrence_b, sp.spline_degree)
@@ -699,6 +846,7 @@ class OpProperties:
     nosolve: bool = False
     overlap_load: float = 0.5
     use_parallel: bool = False
+    sparse_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -708,6 +856,8 @@ class FrozenStencilGraph:
     stencil_size: int
     active_rows: jnp.ndarray
     knn_indices: jnp.ndarray
+    periodic_bounds: jnp.ndarray | None = None
+    periodic_dims: jnp.ndarray | None = None
 
 
 @dataclass
@@ -735,7 +885,7 @@ class RBFStencil:
         self.ell = sp.ell
         self.npoly = sp.npoly
         r = distance_matrix(x, x)
-        self.width = max(float(r.max(initial=0.0)), 1.0)
+        self.width = max(float(r.max(initial=0.0)), 1e-300)  # stencil diameter; no floor at 1
         self.xm = x.mean(axis=0)
         self.xc = (x - self.xm) / self.width
         self.basis = PolynomialBasis.from_total_degree(self.s_dim, self.ell, family="legendre", center=jnp.zeros(self.s_dim), scale=1.0)
@@ -761,7 +911,7 @@ class RBFStencil:
         xec = (xe - self.xm) / self.width
         pe = self.basis.evaluate(xec, jnp.zeros((1, self.s_dim), dtype=int), True)
         rt = jnp.vstack([self.phs_rbf(re, sp.spline_degree).T, pe.T])
-        lagrange = self.stable_solve(self.solve_lhs, rt)
+        lagrange = self.stable_solve(self.solve_lhs, rt, self.n)
         return lagrange[: self.n].T
 
     def get_interp_mat(self) -> jnp.ndarray:
@@ -806,7 +956,7 @@ class RBFStencil:
         r = distance_matrix(x, x)
         r_rhs = r[rhs_inds]
         b = self._apply_operator(apply_op, sp, op, r_rhs, x_subset, x, x_at_origin_subset, self.xc)
-        w = b if op.nosolve else self.stable_solve(self.solve_lhs, b)[: self.n]
+        w = b if op.nosolve else self.stable_solve(self.solve_lhs, b, self.n)[: self.n]
         if rhs_inds.size == 1 and int(rhs_inds[0]) == 0:
             name = str(apply_op).lower()
             if name in {"lap", "laplacian"}:
@@ -825,8 +975,20 @@ class RBFStencil:
         nr_subset = nr[rhs_inds]
         r = distance_matrix(x, x)
         r_rhs = r[rhs_inds]
-        b = self._apply_boundary_operator(apply_op, sp, op, neu_coeff, dir_coeff, r_rhs, x_subset, x, x_at_origin_subset, self.xc, nr_subset)
-        w = self.stable_solve(self.solve_lhs, b)[: self.n]
+        standard_bc = isinstance(apply_op, str) and apply_op.lower() in {"bc", "boundary"}
+        nodal_values = (jnp.arange(self.n)[:, None] == rhs_inds[None, :]).astype(x.dtype) if standard_bc else None
+        if standard_bc and neu_coeff == 0:
+            if dir_coeff == 0:
+                raise ValueError("both boundary coefficients cannot be zero")
+            w = dir_coeff * nodal_values
+        else:
+            # Nodal value evaluation is exact; only the normal derivative
+            # requires an RBF-FD solve. Custom functionals retain their RHS.
+            solve_dir = 0. if standard_bc else dir_coeff
+            b = self._apply_boundary_operator(apply_op, sp, op, neu_coeff, solve_dir, r_rhs, x_subset, x, x_at_origin_subset, self.xc, nr_subset)
+            w = self.stable_solve(self.solve_lhs, b, self.n)[: self.n]
+            if standard_bc:
+                w = w + dir_coeff * nodal_values
         if rhs_inds.size == 1 and int(rhs_inds[0]) == 0:
             self.bc = w
         return w
@@ -873,8 +1035,8 @@ class RBFStencil:
         return jnp.where(jnp.isfinite(l), l, 0.0)
 
     @staticmethod
-    def stable_solve(a: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarray:
-        return _stable_solve(a, b)
+    def stable_solve(a: jnp.ndarray, b: jnp.ndarray, npoints: int | None = None) -> jnp.ndarray:
+        return _stable_solve(a, b) if npoints is None else _solve_rbf_augmented(a, b, npoints)
 
 
 @dataclass
@@ -903,7 +1065,7 @@ class WeightedLeastSquaresStencil:
         self.x_stencil = x
         self.xm = x[0]
         r2 = jnp.sum((x - self.xm) ** 2, axis=1)
-        self.width = max(float(jnp.sqrt(r2.max(initial=0.0))), 1.0)
+        self.width = max(float(jnp.sqrt(r2.max(initial=0.0))), 1e-300)  # stencil radius; no floor at 1
         self.xc = (x - self.xm) / self.width
         self.basis = PolynomialBasis.from_total_degree(self.s_dim, self.fit_ell, family="legendre", center=jnp.zeros(self.s_dim), scale=1.0)
         p = self.basis.evaluate(self.xc, jnp.zeros((1, self.s_dim), dtype=int), True)
@@ -1030,6 +1192,15 @@ class FDDiffOp:
             expected_point_set = StencilProperties.normalize_point_set(st_props.point_set)
             if stencil_graph.tree_mode != expected_tree_mode or stencil_graph.point_set != expected_point_set:
                 raise ValueError("stencil graph is incompatible with the requested tree/point set")
+            if (stencil_graph.periodic_bounds is None)!=(domain.periodic_bounds is None):
+                raise ValueError("stencil graph periodicity differs from the domain")
+            if domain.periodic_bounds is not None and (
+                stencil_graph.periodic_bounds.shape!=domain.periodic_bounds.shape
+                or stencil_graph.periodic_dims is None
+                or stencil_graph.periodic_dims.shape!=domain.periodic_dims.shape
+                or not bool(jnp.all(stencil_graph.periodic_bounds==domain.periodic_bounds)
+                            &jnp.all(stencil_graph.periodic_dims==domain.periodic_dims))):
+                raise ValueError("stencil graph periodic bounds/mask are stale")
             active_rows = jnp.asarray(stencil_graph.active_rows, dtype=int) if active_rows is None else jnp.asarray(active_rows, dtype=int)
             if active_rows.shape != stencil_graph.active_rows.shape or not bool(jnp.all(active_rows == stencil_graph.active_rows)):
                 raise ValueError("active_rows must match the supplied stencil graph")
@@ -1039,12 +1210,15 @@ class FDDiffOp:
                 active_rows = jnp.arange(1, center_points.shape[0] + 1)
             active_rows = jnp.asarray(active_rows, dtype=int)
             active_centers = center_points[active_rows - 1]
-            knn_indices, _ = domain.query_knn(st_props.tree_mode, active_centers, st_props.n)
+            knn_indices, _ = domain.query_knn(st_props.tree_mode, active_centers, st_props.n,
+                center_indices=domain.tree_indices_for_globals(
+                    st_props.tree_mode,center_col_globals[active_rows-1]))
             knn_indices = knn_indices + 1
         active_centers = center_points[active_rows - 1]
-        self.n1 = int(center_points.shape[0])
-        self.n2 = _tree_column_count(domain, st_props.tree_mode)
-        self.op_matrix = jnp.zeros((0, 0), dtype=float)
+        local_coordinates=domain.stencil_coordinates(st_props.tree_mode,active_centers,knn_indices-1)
+        self.n1 = int(center_row_ids.max(initial=0))
+        self.n2 = int(stencil_globals.max(initial=0))
+        matrix = None if op_props.sparse_only else jnp.zeros((self.n1, self.n2), dtype=float)
         self.stencils = []
         self.recorded_stencil_centers = []
         self.recorded_stencil_globals = jnp.zeros(active_rows.size, dtype=int)
@@ -1055,19 +1229,23 @@ class FDDiffOp:
             self.recorded_stencil_centers = [pt for pt in active_centers]
         self.recorded_stencil_globals = active_globals
 
+        power = getattr(op_name, "_kernelpack_laplacian_power", None)
+        power_fast = (power is not None and power > 0 and st_props.ell < 2*power
+                      and st_props.spline_degree % 2 == 1
+                      and isinstance(self.approx_factory(), RBFStencil))
         fast_path_ok = (
             not op_props.record_stencils
-            and isinstance(op_name, str)
-            and str(op_name).lower() in {"lap", "laplacian", "interp", "interpolation", "grad", "gradient", "bc", "boundary"}
+            and (power_fast or (isinstance(op_name, str)
+            and str(op_name).lower() in {"lap", "laplacian", "interp", "interpolation", "grad", "gradient", "bc", "boundary"}))
         )
         if fast_path_ok:
-            x_stencils = stencil_points[knn_indices - 1]
+            x_stencils = local_coordinates
             batched_normals = center_normals[active_rows - 1] if use_boundary and center_normals is not None else None
             active_neu = neu_coeff[active_rows - 1] if neu_coeff is not None else None
             active_dir = dir_coeff[active_rows - 1] if dir_coeff is not None else None
             batched_weights = self._batched_weights(
                 x_stencils,
-                str(op_name).lower(),
+                op_name if power_fast else str(op_name).lower(),
                 st_props,
                 op_props,
                 normals=batched_normals,
@@ -1080,6 +1258,11 @@ class FDDiffOp:
                     stencil_globals,
                     knn_indices,
                     batched_weights,
+                )
+                self.op_matrix = (
+                    jnp.zeros((0, 0), dtype=float)
+                    if op_props.sparse_only
+                    else _scatter_operator_matrix(flat_rows, flat_cols, flat_vals, n1=self.n1, n2=self.n2)
                 )
                 self.locations = locations
                 self.values = flat_vals
@@ -1103,13 +1286,17 @@ class FDDiffOp:
                 neu_coeff,
                 dir_coeff,
                 knn_indices[k],
+                local_coordinates[k],
             )
             rows = jnp.full(indices.shape[0], row_id - 1, dtype=int)
             cols = stencil_globals[indices - 1] - 1
+            if matrix is not None:
+                matrix = matrix.at[rows, cols].add(w[:, 0])
             locs.append(jnp.column_stack([rows + 1, cols + 1]))
             vals.append(w[:, 0])
             if op_props.record_stencils:
                 self.stencils.append({"Approx": stencil, "Indices": stencil_globals[indices - 1]})
+        self.op_matrix = jnp.zeros((0, 0), dtype=float) if matrix is None else matrix
         self.locations = jnp.vstack(locs) if locs else jnp.zeros((0, 2), dtype=int)
         self.values = jnp.concatenate(vals) if vals else jnp.zeros(0)
 
@@ -1160,7 +1347,7 @@ class CrossNodeDiffOp:
         knn_indices = knn_indices + 1
 
         approx = self.approx_factory()
-        x_stencils = source_points[knn_indices - 1]
+        x_stencils = source_domain.stencil_coordinates(st_props.tree_mode,active_targets,knn_indices-1)
         batched_weights = _batched_weights_at_points(approx, x_stencils, active_targets, st_props, op_name, op_props)
         if batched_weights is None:
             raise ValueError("CrossNodeDiffOp currently supports batched RBF/WLS interpolation and gradient operators")
@@ -1171,7 +1358,11 @@ class CrossNodeDiffOp:
             knn_indices,
             batched_weights,
         )
-        self.op_matrix = jnp.zeros((0, 0), dtype=float)
+        self.op_matrix = (
+            jnp.zeros((0, 0), dtype=float)
+            if op_props.sparse_only
+            else _scatter_operator_matrix(flat_rows, flat_cols, flat_vals, n1=self.n1, n2=self.n2)
+        )
         self.locations = locations
         self.values = flat_vals
 
@@ -1207,21 +1398,25 @@ def build_frozen_stencil_graph(
         active_rows = jnp.arange(1, center_points.shape[0] + 1)
     active_rows = jnp.asarray(active_rows, dtype=int)
     active_centers = center_points[active_rows - 1]
-    knn_indices, _ = domain.query_knn(st_props.tree_mode, active_centers, st_props.n)
+    knn_indices, _ = domain.query_knn(st_props.tree_mode, active_centers, st_props.n,
+        center_indices=domain.tree_indices_for_globals(
+            st_props.tree_mode,_center_col_globals[active_rows-1]))
     return FrozenStencilGraph(
         tree_mode=st_props.tree_mode,
         point_set=st_props.point_set,
         stencil_size=int(knn_indices.shape[1]),
         active_rows=active_rows,
         knn_indices=knn_indices + 1,
+        periodic_bounds=domain.periodic_bounds,
+        periodic_dims=domain.periodic_dims,
     )
 
 
-def _assemble_one(approx_factory: Callable[[], object], stencil_points: jnp.ndarray, center_points: jnp.ndarray, center_row_ids: jnp.ndarray, center_col_globals: jnp.ndarray, center_normals: jnp.ndarray | None, local_row: int, st_props: StencilProperties, op_props: OpProperties, op_name: str, use_boundary: bool, neu_coeff: jnp.ndarray | None, dir_coeff: jnp.ndarray | None, indices: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, object, jnp.ndarray, int, int]:
+def _assemble_one(approx_factory: Callable[[], object], stencil_points: jnp.ndarray, center_points: jnp.ndarray, center_row_ids: jnp.ndarray, center_col_globals: jnp.ndarray, center_normals: jnp.ndarray | None, local_row: int, st_props: StencilProperties, op_props: OpProperties, op_name: str, use_boundary: bool, neu_coeff: jnp.ndarray | None, dir_coeff: jnp.ndarray | None, indices: jnp.ndarray, local_coordinates: jnp.ndarray | None = None) -> tuple[jnp.ndarray, jnp.ndarray, object, jnp.ndarray, int, int]:
     center_point = center_points[local_row - 1]
     center_row_id = int(center_row_ids[local_row - 1])
     center_col_global = int(center_col_globals[local_row - 1])
-    loc_x = stencil_points[indices - 1]
+    loc_x = stencil_points[indices - 1] if local_coordinates is None else local_coordinates
     stencil = approx_factory()
     if use_boundary:
         loc_nr = center_normals[local_row - 1 : local_row]
@@ -1258,3 +1453,4 @@ def _tree_column_count(domain: DomainDescriptor, tree_mode: str) -> int:
     if mode == "boundary":
         return domain.get_num_interior_nodes() + domain.get_num_bdry_nodes()
     return int(domain.get_tree_points(mode).shape[0])
+

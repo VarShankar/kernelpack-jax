@@ -44,6 +44,12 @@ examples = [
 warp = [
   "warp-lang>=1.2",
 ]
+paper = [
+  "equinox>=0.13",
+  "matplotlib>=3.9",
+  "optax>=0.2",
+  "optimistix>=0.1",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

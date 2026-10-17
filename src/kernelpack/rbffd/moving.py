@@ -4,24 +4,35 @@ from dataclasses import dataclass, field
 from functools import partial
 import os
 
-from jax import jit
+from jax import jit, lax
 import jax.numpy as jnp
-import numpy as np
 
 from kernelpack.accelerators import warp_available
 from kernelpack.domain import DomainDescriptor, MovingDomainDescriptor
 
 from .core import (
-    FDDiffOp,
-    FDODiffOp,
-    FrozenStencilGraph,
     OpProperties,
-    RBFStencil,
     StencilProperties,
     _build_legendre_basis_data,
     _evaluate_factored_rbf_interpolants,
     _factor_batched_rbf_interpolants,
+    _pick_centers,
+    _batched_rbf_weights,
 )
+
+
+@partial(jit, static_argnames=("batch_size",))
+def _fresh_row_batches(active, reusable, *, batch_size):
+    """Fixed-capacity device compaction; sentinel rows are dropped on scatter."""
+    count=active.shape[0]
+    rows=jnp.nonzero(active & ~reusable,size=count,fill_value=count)[0]
+    rows=jnp.pad(rows,(0,(-count)%batch_size),constant_values=count)
+    return rows.reshape(-1,batch_size)
+
+
+def _interpolation_signature(properties):
+    """Snapshot method parameters; the properties object itself is mutable."""
+    return (properties.n,properties.dim,properties.ell,properties.spline_degree)
 
 
 @jit
@@ -118,8 +129,8 @@ def _tree_data(
 class MovingDifferentiationUpdater:
     """Selectively refresh rows of a moving RBF-FD operator.
 
-    Dynamic identity and neighborhood checks run on the host. Every fresh row
-    is delegated to the existing batched JAX RBF-FD assembler.
+    Identity checks, row compaction and fresh-row assembly stay on device.
+    Fixed batches reuse the shared JAX RBF-FD weight kernels.
     """
 
     stencil_properties: StencilProperties
@@ -138,9 +149,10 @@ class MovingDifferentiationUpdater:
     stencil_points: jnp.ndarray = field(default_factory=lambda: jnp.zeros((0, 0, 0)))
     neu_coeff: jnp.ndarray = field(default_factory=lambda: jnp.zeros((0,)))
     dir_coeff: jnp.ndarray = field(default_factory=lambda: jnp.zeros((0,)))
-    last_reused_row_count: int = 0
-    last_recomputed_row_count: int = 0
+    last_reused_row_count: jnp.ndarray | int = 0
+    last_recomputed_row_count: jnp.ndarray | int = 0
     assembly_batch_size: int = 128
+    _method_signature: tuple | None = field(default=None,init=False,repr=False)
 
     def __post_init__(self) -> None:
         self.operator = str(self.operator).lower()
@@ -181,16 +193,22 @@ class MovingDifferentiationUpdater:
         domain = moving_domain.get_discretization_domain()
         target_points, target_ids, target_active = _point_set_data(moving_domain, self.point_set)
         tree_points, tree_ids, _tree_active = _tree_data(moving_domain, self.tree_mode)
+        _, _, center_globals, _ = _pick_centers(domain, self.point_set)
+        center_indices = domain.tree_indices_for_globals(self.tree_mode, center_globals)
+        center_indices = jnp.where(target_active, center_indices, -1)
         knn_indices, _ = domain.query_knn(
             self.tree_mode,
             target_points,
             self.stencil_properties.n,
             backend=_neighbor_backend(),
+            center_indices=center_indices,
         )
-        stencil_points = tree_points[knn_indices]
+        stencil_points = domain.stencil_coordinates(self.tree_mode,target_points,knn_indices)
         stencil_ids = tree_ids[knn_indices]
         row_count = target_points.shape[0]
         stencil_size = knn_indices.shape[1]
+        signature=(_interpolation_signature(self.stencil_properties),self.operator,
+            self.point_set,self.tree_mode,self.assembly_mode,self.operator_properties.selectdim)
 
         use_boundary = self.operator in {"bc", "boundary"}
         current_neu = jnp.zeros((row_count,), dtype=float) if neu_coeff is None else jnp.asarray(neu_coeff, dtype=float).reshape(-1)
@@ -200,7 +218,8 @@ class MovingDifferentiationUpdater:
 
         reusable = jnp.zeros((row_count,), dtype=bool)
         old_rows = jnp.zeros((row_count,), dtype=int)
-        if allow_reuse and self.target_ids.size and self.weights.shape[1] == stencil_size:
+        reuse_method=signature==self._method_signature
+        if allow_reuse and reuse_method and self.target_ids.size and self.weights.shape[1] == stencil_size:
             reusable, old_rows = _reusable_mask(
                 target_ids,
                 tree_ids,
@@ -221,27 +240,18 @@ class MovingDifferentiationUpdater:
             reusable = reusable & target_active
 
         weights = jnp.zeros((row_count, stencil_size), dtype=float)
-        reusable_host = np.asarray(reusable)
-        reusable_rows = np.flatnonzero(reusable_host)
-        if allow_reuse and self.weights.shape == weights.shape:
+        if allow_reuse and reuse_method and self.target_ids.size and self.weights.shape[1] == stencil_size:
             weights = jnp.where(reusable[:, None], self.weights[old_rows], weights)
-        fresh_rows = np.flatnonzero(np.asarray(target_active) & ~reusable_host)
-        if fresh_rows.size:
-            batch_size = max(1, int(self.assembly_batch_size))
-            for start in range(0, fresh_rows.size, batch_size):
-                valid_rows = fresh_rows[start : start + batch_size]
-                padded_rows = np.full((batch_size,), valid_rows[0], dtype=int)
-                padded_rows[: valid_rows.size] = valid_rows
-                batch_device = jnp.asarray(padded_rows, dtype=int)
-                batch_weights = self._assemble_rows(
-                    domain,
-                    batch_device,
-                    knn_indices[batch_device],
-                    current_neu if use_boundary else None,
-                    current_dir if use_boundary else None,
-                )
-                valid = jnp.arange(batch_size) < valid_rows.size
-                weights = weights.at[batch_device].add(jnp.where(valid[:, None], batch_weights, 0.0))
+        if row_count:
+            batches=_fresh_row_batches(target_active,reusable,batch_size=max(1,int(self.assembly_batch_size)))
+            def step(current,rows):
+                def assemble(value):
+                    safe=jnp.where(rows<row_count,rows,rows[0])
+                    batch_weights=self._assemble_rows(domain,safe,knn_indices[safe],
+                        current_neu if use_boundary else None,current_dir if use_boundary else None)
+                    return value.at[rows].set(batch_weights,mode="drop")
+                return lax.cond(jnp.any(rows<row_count),assemble,lambda value:value,current),None
+            weights=lax.scan(step,weights,batches)[0]
 
         self.weights = weights
         self.knn_indices = knn_indices
@@ -251,8 +261,9 @@ class MovingDifferentiationUpdater:
         self.stencil_points = stencil_points
         self.neu_coeff = current_neu
         self.dir_coeff = current_dir
-        self.last_reused_row_count = int(reusable_rows.size)
-        self.last_recomputed_row_count = int(fresh_rows.size)
+        self.last_reused_row_count = jnp.count_nonzero(reusable)
+        self.last_recomputed_row_count = jnp.count_nonzero(target_active & ~reusable)
+        self._method_signature=signature
 
     def _assemble_rows(
         self,
@@ -262,25 +273,14 @@ class MovingDifferentiationUpdater:
         neu_coeff: jnp.ndarray | None,
         dir_coeff: jnp.ndarray | None,
     ) -> jnp.ndarray:
-        assembler = FDODiffOp(lambda: RBFStencil()) if self.assembly_mode in {"fdo", "overlapped"} else FDDiffOp(lambda: RBFStencil())
-        graph = FrozenStencilGraph(
-            tree_mode=self.tree_mode,
-            point_set=self.point_set,
-            stencil_size=int(knn_indices.shape[1]),
-            active_rows=active_rows + 1,
-            knn_indices=knn_indices + 1,
-        )
-        assembler.assemble_op(
-            domain,
-            self.operator,
-            self.stencil_properties,
+        centers,_,_,normals=_pick_centers(domain,self.point_set)
+        coordinates=domain.stencil_coordinates(self.tree_mode,centers[active_rows],knn_indices)
+        values=_batched_rbf_weights(coordinates,self.stencil_properties,self.operator,
             self.operator_properties,
-            neu_coeff=neu_coeff,
-            dir_coeff=dir_coeff,
-            active_rows=active_rows + 1,
-            stencil_graph=graph,
-        )
-        return jnp.asarray(assembler.values, dtype=float).reshape((active_rows.size, knn_indices.shape[1]))
+            normals=normals[active_rows] if normals is not None else None,
+            neu_coeff=neu_coeff[active_rows] if neu_coeff is not None else None,
+            dir_coeff=dir_coeff[active_rows] if dir_coeff is not None else None)
+        return values.reshape((active_rows.size,knn_indices.shape[1]))
 
     def get_sparse_op(self):
         from kernelpack.solvers._common import SparseCOOMatrix
@@ -310,6 +310,7 @@ class MovingDomainLocalInterpolator:
     source_ids: jnp.ndarray | None = None
     source_points: jnp.ndarray = field(default_factory=lambda: jnp.zeros((0, 0)), init=False)
     stencil_indices: jnp.ndarray = field(default_factory=lambda: jnp.zeros((0, 0), dtype=int), init=False)
+    local_coordinates: jnp.ndarray = field(default_factory=lambda: jnp.zeros((0,0,0)),init=False)
     lu: jnp.ndarray = field(default_factory=lambda: jnp.zeros((0, 0, 0)), init=False)
     pivots: jnp.ndarray = field(default_factory=lambda: jnp.zeros((0, 0), dtype=int), init=False)
     width: jnp.ndarray = field(default_factory=lambda: jnp.zeros((0,)), init=False)
@@ -317,11 +318,17 @@ class MovingDomainLocalInterpolator:
     index_set: jnp.ndarray = field(default_factory=lambda: jnp.zeros((0, 0), dtype=int), init=False)
     recurrence_a: jnp.ndarray = field(default_factory=lambda: jnp.zeros((0, 0)), init=False)
     recurrence_b: jnp.ndarray = field(default_factory=lambda: jnp.zeros((0, 0)), init=False)
-    last_reused_row_count: int = field(default=0, init=False)
-    last_recomputed_row_count: int = field(default=0, init=False)
+    last_reused_row_count: jnp.ndarray | int = field(default=0, init=False)
+    last_recomputed_row_count: jnp.ndarray | int = field(default=0, init=False)
     factor_batch_size: int = 512
+    _periodic_bounds: jnp.ndarray | None = field(default=None, init=False, repr=False)
+    _periodic_dims: jnp.ndarray | None = field(default=None, init=False, repr=False)
+    _method_signature: tuple | None = field(default=None,init=False,repr=False)
 
     def __post_init__(self) -> None:
+        self._periodic_bounds = self.domain.periodic_bounds
+        self._periodic_dims = self.domain.periodic_dims
+        self._method_signature = _interpolation_signature(self.stencil_properties)
         self.source_points = self.domain.get_int_bdry_nodes()
         if self.source_ids is None:
             self.source_ids = jnp.arange(self.source_points.shape[0], dtype=jnp.int64)
@@ -334,33 +341,39 @@ class MovingDomainLocalInterpolator:
             self.source_points,
             self.stencil_properties.n,
             backend=_neighbor_backend(),
+            center_indices=jnp.where(self.domain.get_physical_active_mask(),
+                jnp.arange(len(self.source_points),dtype=jnp.int32),-1),
         )
-        stencil_points = self.source_points[self.stencil_indices]
+        stencil_points = self.domain.stencil_coordinates("interior_boundary",self.source_points,self.stencil_indices)
+        self.local_coordinates=stencil_points
         self.index_set, self.recurrence_a, self.recurrence_b = _build_legendre_basis_data(
             self.stencil_properties.dim,
             self.stencil_properties.ell,
         )
-        active = np.asarray(self.domain.get_physical_active_mask(), dtype=bool)
-        reusable = np.zeros((self.source_points.shape[0],), dtype=bool)
+        active = self.domain.get_physical_active_mask()
+        reusable = jnp.zeros((self.source_points.shape[0],), dtype=bool)
         old_rows = jnp.zeros((self.source_points.shape[0],), dtype=int)
-        if self.previous is not None and self.previous.source_ids.size:
+        reuse_method=(self.previous is not None and self.previous.source_ids.size
+            and self.previous._method_signature==self._method_signature)
+        if reuse_method:
             old_rows, found = _match_previous_rows(self.source_ids, self.previous.source_ids)
             same_centers = jnp.all(self.source_points == self.previous.source_points[old_rows], axis=1)
             stencil_ids = self.source_ids[self.stencil_indices]
             old_stencil_ids = self.previous.source_ids[self.previous.stencil_indices[old_rows]]
             same_ids = jnp.all(stencil_ids == old_stencil_ids, axis=1)
-            old_stencil_points = self.previous.source_points[self.previous.stencil_indices[old_rows]]
+            old_stencil_points = self.previous.local_coordinates[old_rows]
             same_points = jnp.all(stencil_points == old_stencil_points, axis=(1, 2))
-            reusable = np.asarray(found & same_centers & same_ids & same_points, dtype=bool) & active
+            reusable = (found & same_centers & same_ids & same_points) & active
 
-        system_size = self.stencil_properties.n + self.stencil_properties.npoly
+        # Derive dimensions from the assembled basis, not the mutable npoly
+        # convenience field (which may be stale after changing ell).
+        system_size = self.stencil_indices.shape[1] + self.index_set.shape[0]
         self.lu = jnp.zeros((self.source_points.shape[0], system_size, system_size), dtype=float)
         self.pivots = jnp.zeros((self.source_points.shape[0], system_size), dtype=jnp.int32)
         self.width = jnp.ones((self.source_points.shape[0],), dtype=float)
         self.centers = jnp.zeros_like(self.source_points)
-        reusable_rows = np.flatnonzero(reusable)
-        if reusable_rows.size:
-            reusable_device = jnp.asarray(reusable, dtype=bool)
+        if reuse_method:
+            reusable_device = reusable
             old_lu = self.previous.lu[old_rows]
             old_pivots = self.previous.pivots[old_rows]
             old_width = self.previous.width[old_rows]
@@ -370,28 +383,36 @@ class MovingDomainLocalInterpolator:
             self.width = jnp.where(reusable_device, old_width, self.width)
             self.centers = jnp.where(reusable_device[:, None], old_centers, self.centers)
 
-        fresh_rows = np.flatnonzero(active & ~reusable)
         batch_size = max(1, int(self.factor_batch_size))
-        for start in range(0, fresh_rows.size, batch_size):
-            valid_rows = fresh_rows[start : start + batch_size]
-            padded_rows = np.full((batch_size,), valid_rows[0], dtype=int)
-            padded_rows[: valid_rows.size] = valid_rows
-            batch_rows = jnp.asarray(padded_rows, dtype=int)
-            batch_lu, batch_pivots, batch_width, batch_centers = _factor_batched_rbf_interpolants(
-                stencil_points[batch_rows],
-                self.index_set,
-                self.recurrence_a,
-                self.recurrence_b,
-                self.stencil_properties.spline_degree,
-            )
-            self.lu = self.lu.at[batch_rows].set(batch_lu)
-            self.pivots = self.pivots.at[batch_rows].set(batch_pivots)
-            self.width = self.width.at[batch_rows].set(batch_width)
-            self.centers = self.centers.at[batch_rows].set(batch_centers)
-        self.last_reused_row_count = int(reusable_rows.size)
-        self.last_recomputed_row_count = int(fresh_rows.size)
+        capacity=len(self.source_points)
+        if capacity:
+            batches=_fresh_row_batches(active,reusable,batch_size=batch_size)
+            def step(state,rows):
+                def factor(current):
+                    safe=jnp.where(rows<capacity,rows,rows[0])
+                    values=_factor_batched_rbf_interpolants(stencil_points[safe],self.index_set,
+                        self.recurrence_a,self.recurrence_b,self.stencil_properties.spline_degree)
+                    return tuple(old.at[rows].set(new,mode="drop") for old,new in zip(current,values))
+                return lax.cond(jnp.any(rows<capacity),factor,lambda current:current,state),None
+            self.lu,self.pivots,self.width,self.centers=lax.scan(step,
+                (self.lu,self.pivots,self.width,self.centers),batches)[0]
+        self.last_reused_row_count = jnp.count_nonzero(reusable)
+        self.last_recomputed_row_count = jnp.count_nonzero(active & ~reusable)
 
     def evaluate(self, nodal_values: jnp.ndarray, query_points: jnp.ndarray) -> jnp.ndarray:
+        bounds = self.domain.periodic_bounds
+        dims = self.domain.periodic_dims
+        changed = (bounds is None) != (self._periodic_bounds is None)
+        if not changed and bounds is not None:
+            changed = (bounds.shape != self._periodic_bounds.shape
+                or dims is None or self._periodic_dims is None
+                or dims.shape != self._periodic_dims.shape
+                or not bool(jnp.all(bounds == self._periodic_bounds)
+                    & jnp.all(dims == self._periodic_dims)))
+        if changed:
+            raise ValueError("Periodic configuration changed; rebuild the local interpolator")
+        if self._method_signature != _interpolation_signature(self.stencil_properties):
+            raise ValueError("Interpolation method changed; rebuild the local interpolator")
         nodal_values = jnp.asarray(nodal_values, dtype=float).reshape(-1)
         query_points = jnp.atleast_2d(jnp.asarray(query_points, dtype=float))
         if nodal_values.size != self.domain.get_num_int_bdry_nodes():
@@ -407,7 +428,11 @@ class MovingDomainLocalInterpolator:
         )
         owner_indices = owner_indices[:, 0]
         stencil_indices = self.stencil_indices[owner_indices]
-        stencil_points = self.source_points[stencil_indices]
+        stencil_points = self.local_coordinates[owner_indices]
+        if self._periodic_bounds is not None:
+            from kernelpack.domain.stencils import nearest_periodic_images
+            query_points=nearest_periodic_images(query_points[:,None,:],self.source_points[owner_indices],
+                self._periodic_bounds[1]-self._periodic_bounds[0],self._periodic_dims)[:,0,:]
         weights = _evaluate_factored_rbf_interpolants(
             self.lu,
             self.pivots,
@@ -420,6 +445,6 @@ class MovingDomainLocalInterpolator:
             self.recurrence_a,
             self.recurrence_b,
             self.stencil_properties.spline_degree,
-            self.stencil_properties.n,
+            self.stencil_indices.shape[1],
         )
         return jnp.sum(weights * nodal_values[stencil_indices], axis=1)

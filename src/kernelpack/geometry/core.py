@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from functools import partial
 
 from jax import jit, lax
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -117,13 +118,17 @@ def weighted_sample_elimination_mis(x: jnp.ndarray, radius: float) -> jnp.ndarra
 
 
 @jit
-def _weighted_sample_elimination_mis_impl(x: jnp.ndarray, radius: float) -> jnp.ndarray:
+def _weighted_sample_elimination_mis_impl(
+    x: jnp.ndarray, radius: float, feature_flags: jnp.ndarray | None = None,
+) -> jnp.ndarray:
     d = distance_matrix(x, x)
     n = x.shape[0]
     idx = jnp.arange(n)
     nonself = idx[:, None] != idx[None, :]
     c = jnp.minimum(d, 2.0 * radius)
     weights = jnp.sum(jnp.where(nonself & (d <= 2.0 * radius), (1.0 - c / (2.0 * radius)) ** 8, 0.0), axis=1)
+    if feature_flags is not None:
+        weights = jnp.where(feature_flags, jnp.inf, weights)
     conflict = nonself & (d <= radius)
     higher_priority = (weights[None, :] > weights[:, None]) | (
         (weights[None, :] == weights[:, None]) & (idx[None, :] < idx[:, None])
@@ -379,7 +384,9 @@ def _build_closed_curve_geometric_model_ps_impl(
 @partial(jit, static_argnums=(3,))
 def _eval_open_curve_model(u_model: jnp.ndarray, weights: jnp.ndarray, poly_coeffs: jnp.ndarray, degree: int, u: jnp.ndarray) -> jnp.ndarray:
     u = jnp.clip(jnp.asarray(u, dtype=float).reshape(-1), 0.0, 1.0)
-    r = distance_matrix(u[:, None], u_model[:, None])
+    # In one parameter dimension use abs directly: norm(0) introduces a
+    # spurious NaN under AD, while |du|^3 has a finite first derivative.
+    r = jnp.abs(u[:, None] - u_model[None, :])
     return phs_kernel(r, degree) @ weights + jnp.column_stack([jnp.ones(u.size), u]) @ poly_coeffs
 
 
@@ -408,9 +415,11 @@ def _build_open_curve_geometric_model_ps_impl(
     min_rad: float,
     anisotropic: bool,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    if degree not in (1, 2, 3):
+        raise ValueError("affine open-curve augmentation requires a PHS degree at most 3")
     data = jnp.asarray(data, dtype=float)
     u = chord_length_param(data, False)
-    r = distance_matrix(u[:, None], u[:, None])
+    r = jnp.abs(u[:, None] - u[None, :])
     k = phs_kernel(r, degree)
     p = jnp.column_stack([jnp.ones(u.size), u])
     reg = 1e-12 * jnp.maximum(1.0, jnp.abs(k).max(initial=0.0))
@@ -422,11 +431,14 @@ def _build_open_curve_geometric_model_ps_impl(
     us = jnp.linspace(0.0, 1.0, ns)
     pts = _eval_open_curve_model(u, weights, poly_coeffs, degree, us)
     _, nr = _eval_open_curve_frame_model(u, weights, poly_coeffs, degree, us)
+    # Open-curve endpoints are actual geometric features. Give them priority
+    # during thinning, rather than mislabeling surviving interior samples.
+    endpoints = (jnp.arange(len(pts)) == 0) | (jnp.arange(len(pts)) == len(pts)-1)
     if method == 1 and anisotropic:
-        keep = _weighted_sample_elimination_mis_impl(pts / rad_arr[None, :], 1.0)
-        keep_uniform = _weighted_sample_elimination_mis_impl(pts, min_rad)
+        keep = _weighted_sample_elimination_mis_impl(pts / rad_arr[None, :], 1.0, endpoints)
+        keep_uniform = _weighted_sample_elimination_mis_impl(pts, min_rad, endpoints)
     elif method == 1:
-        keep = _weighted_sample_elimination_mis_impl(pts, min_rad)
+        keep = _weighted_sample_elimination_mis_impl(pts, min_rad, endpoints)
         keep_uniform = keep
     else:
         keep = jnp.ones(pts.shape[0], dtype=bool)
@@ -505,6 +517,8 @@ def _build_open_surface_geometric_model_ps_impl(
     anisotropic: bool,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     del origin, basis
+    if degree not in (1, 2, 3):
+        raise ValueError("affine surface-patch augmentation requires a PHS degree at most 3")
     data = jnp.asarray(data, dtype=float)
     uv = jnp.asarray(uv, dtype=float)
     uv_eval = jnp.asarray(uv_eval, dtype=float)
@@ -536,8 +550,14 @@ def _build_open_surface_geometric_model_ps_impl(
 @partial(jit, static_argnums=(3,))
 def _eval_open_surface_model(uv_model: jnp.ndarray, weights: jnp.ndarray, poly_coeffs: jnp.ndarray, degree: int, uv: jnp.ndarray) -> jnp.ndarray:
     uv = jnp.asarray(uv, dtype=float)
-    r = distance_matrix(uv, uv_model)
-    return phs_kernel(r, degree) @ weights + jnp.column_stack([jnp.ones(uv.shape[0]), uv]) @ poly_coeffs
+    if degree == 3:
+        # r^3 is differentiable at a center. Form it from squared distances
+        # so AD does not encounter the undefined derivative of norm(0).
+        squared = jnp.sum((uv[:, None, :] - uv_model[None, :, :]) ** 2, axis=2)
+        kernel = squared ** 1.5
+    else:
+        kernel = phs_kernel(distance_matrix(uv, uv_model), degree)
+    return kernel @ weights + jnp.column_stack([jnp.ones(uv.shape[0]), uv]) @ poly_coeffs
 
 
 @partial(jit, static_argnums=(3,))
@@ -929,6 +949,13 @@ class RBFLevelSet:
     cfi_res_rbf_coeffs: jnp.ndarray = field(default_factory=lambda: jnp.zeros(0))
     cfi_res_constant: float = 0.0
     cfi_multi_indices: jnp.ndarray = field(default_factory=lambda: jnp.zeros((0, 0), dtype=int))
+    cfpu_model: object = None
+
+    def build_level_set_from_cfpu(self,segments,x,nr,*,options=None):
+        from .cfpu import build_cfpu,CFPUOptions
+        self.cfpu_model=build_cfpu(segments,x,nr,options=options or CFPUOptions())
+        self.mode='cfpu'; self.xd=jnp.asarray(x); self.nrd=jnp.asarray(nr)
+        self.n=len(x); self.dim=self.xd.shape[1]
 
     def build_level_set_from_cfi(self, x: jnp.ndarray, nr: jnp.ndarray, spline_degree: int = 3) -> None:
         x = jnp.asarray(x, dtype=float)
@@ -977,6 +1004,11 @@ class RBFLevelSet:
         self.poly_coeffs = c_poly
 
     def evaluate(self, xe: jnp.ndarray) -> jnp.ndarray:
+        if self.mode=='cfpu':
+            result=self.cfpu_model.evaluate(xe)
+            if not isinstance(result,jax.core.Tracer) and not np.isfinite(np.asarray(result)).all():
+                raise ValueError('CFPU far-field sign unresolved; refine geometry quadrature/cover')
+            return result
         if self.mode == "curl_free_potential":
             return _curl_free_zero_mean_potential(
                 jnp.asarray(xe, dtype=float),
@@ -991,6 +1023,7 @@ class RBFLevelSet:
         return self.evaluate_model(self.get_evaluation_model(), xe)
 
     def evaluate_gradient(self, xe: jnp.ndarray) -> jnp.ndarray:
+        if self.mode=='cfpu': return self.cfpu_model.gradient(xe)
         if self.mode == "curl_free_potential":
             return _curl_free_level_set_gradient_impl(
                 jnp.asarray(xe, dtype=float),
@@ -1021,6 +1054,21 @@ class RBFLevelSet:
         }
         if options:
             opts.update(options)
+        if self.mode=='cfpu':
+            def step(_,state):
+                x,counts=state
+                value=self.cfpu_model.evaluate(x); gradient=self.cfpu_model.gradient(x)
+                norm2=jnp.sum(gradient*gradient,axis=1)
+                active=(jnp.abs(value)>opts['value_tolerance']) & (norm2>opts['gradient_tolerance']**2)
+                displacement=value[:,None]*gradient/jnp.maximum(norm2[:,None],opts['gradient_tolerance']**2)
+                length=jnp.linalg.norm(displacement,axis=1)
+                displacement*=jnp.minimum(1.,opts['max_step_norm']/jnp.maximum(length,1e-300))[:,None]
+                return x-jnp.where(active[:,None],displacement,0.),counts+active
+            x,iterations=lax.fori_loop(0,int(opts['max_iterations']),step,
+                (jnp.asarray(initial_points,float),jnp.zeros(len(initial_points),dtype=int)))
+            values=self.evaluate(x)
+            return dict(points=x,level_set_values=values,iterations=iterations,
+                converged=jnp.abs(values)<=opts['value_tolerance'],stalled=jnp.abs(values)>opts['value_tolerance'])
         if self.mode == "curl_free_potential":
             x, final_phi, iterations, stalled = _project_curl_free_level_set_newton_impl(
                 initial_points,
@@ -1072,6 +1120,7 @@ class RBFLevelSet:
         return (self.evaluate(xe) <= -0.5 * tol).astype(jnp.uint32)
 
     def get_evaluation_model(self) -> dict[str, jnp.ndarray | float | int]:
+        if self.mode=='cfpu': return dict(mode='cfpu',model=self.cfpu_model)
         if self.mode == "curl_free_potential":
             return {
                 "mode": self.mode,
@@ -1094,6 +1143,7 @@ class RBFLevelSet:
     @staticmethod
     def evaluate_model(model: dict[str, jnp.ndarray | float | int], xe: jnp.ndarray) -> jnp.ndarray:
         xe = jnp.asarray(xe, dtype=float)
+        if model.get('mode')=='cfpu': return model['model'].evaluate(xe)
         if model.get("mode") == "curl_free_potential":
             return _curl_free_zero_mean_potential(
                 xe,
@@ -1209,7 +1259,9 @@ class EmbeddedSurface:
         self.sep_rad = min_rad
         self.nd = min(nb, self.data_sites.shape[0])
         data = self.data_sites[: self.nd]
-        degree = 7 if anisotropic else 5
+        # Both open curves and surface patches use affine augmentation.
+        # Cubic PHS is compatible with that space for either spacing mode.
+        degree = 3
         ntarget = ne if ne is not None else self._estimate_evaluation_count(dim, min_rad, False)
         if dim == 2:
             u, weights, poly_coeffs, pts, nr, keep, keep_uniform = _build_open_curve_geometric_model_ps_impl(
@@ -1230,7 +1282,8 @@ class EmbeddedSurface:
         elif dim == 3:
             uv = build_planar_parametric_nodes_2d(data, self.nd)
             _, origin, basis = project_to_best_fit_plane(data)
-            uv_eval = build_planar_parametric_eval_nodes_2d(data, ntarget)
+            candidate_count = max(int(supersample_fac) * int(ntarget), int(ntarget)) if method == 1 else int(ntarget)
+            uv_eval = build_planar_parametric_eval_nodes_2d(data, candidate_count)
             weights, poly_coeffs, pts, nr, keep, keep_uniform = _build_open_surface_geometric_model_ps_impl(
                 data,
                 uv,
@@ -1264,6 +1317,9 @@ class EmbeddedSurface:
             elif self.geom_model["type"] == "closed-surface-sbf":
                 pts = self._eval_closed_surface(vals)
                 _, _, nr = self._eval_closed_surface_frame(vals)
+            elif self.geom_model["type"] in ("parametric-pu", "spherical-pu"):
+                pts = self.evaluate_parametric(vals)
+                nr = self.evaluate_parametric_frame(vals)[-1]
             elif self.surf_dim == 1:
                 pts = self._eval_open_curve(vals)
                 _, nr = self._eval_open_curve_frame(vals)
@@ -1283,6 +1339,8 @@ class EmbeddedSurface:
         self.nrmls = -self.nrmls
         self.uniform_nrmls = -self.uniform_nrmls
         self.data_site_nrmls = -self.data_site_nrmls
+        if self.geom_model.get('type') in ('parametric-pu','spherical-pu'):
+            self.geom_model['normal_sign']=-self.geom_model.get('normal_sign',1.)
 
     def get_sample_sites(self) -> jnp.ndarray:
         return self.sample_sites
@@ -1309,6 +1367,8 @@ class EmbeddedSurface:
         """Evaluate the fitted parametric geometry through JIT/device kernels."""
 
         geom_type = self.geom_model.get("type")
+        if geom_type=='affine-face':
+            return jnp.asarray(self.geom_model['origin'])+jnp.asarray(params)@jnp.asarray(self.geom_model['basis']).T
         if geom_type == "closed-curve-sbf":
             return self._eval_closed_curve(params)
         if geom_type == "closed-surface-sbf":
@@ -1317,12 +1377,18 @@ class EmbeddedSurface:
             return self._eval_open_curve(params)
         if geom_type == "surface-patch-rbf":
             return self._eval_open_surface(params)
+        if geom_type in ("parametric-pu", "spherical-pu"):
+            return self.geom_model["model"].evaluate(params)
         raise ValueError("parametric geometry model has not been built")
 
     def evaluate_parametric_frame(self, params: jnp.ndarray) -> tuple[jnp.ndarray, ...]:
         """Evaluate tangents/normals for the fitted parametric geometry."""
 
         geom_type = self.geom_model.get("type")
+        if geom_type=='affine-face':
+            basis=jnp.asarray(self.geom_model['basis']); normal=jnp.asarray(self.geom_model['normal'])
+            return (jnp.broadcast_to(basis[:,0],(len(params),3)),jnp.broadcast_to(basis[:,1],(len(params),3)),
+                    jnp.broadcast_to(normal,(len(params),3)))
         if geom_type == "closed-curve-sbf":
             return self._eval_closed_curve_frame(params)
         if geom_type == "closed-surface-sbf":
@@ -1331,7 +1397,81 @@ class EmbeddedSurface:
             return self._eval_open_curve_frame(params)
         if geom_type == "surface-patch-rbf":
             return self._eval_open_surface_frame(params)
+        if geom_type in ("parametric-pu", "spherical-pu"):
+            jac,nr=self.geom_model["model"].frame(params)
+            nr=nr*self.geom_model.get('normal_sign',1.)
+            return (jac[:,:,0],jac[:,:,1],nr) if self.surf_dim==2 else (jac[:,:,0],nr)
         raise ValueError("parametric geometry model has not been built")
+
+    def build_parametric_pu_model(self, parameters, *, outlines=None, radius=None,
+            validation_parameters=None, validation_positions=None,
+            validation_normals=None, options=None, seed=0, backend="auto",
+            supersample_fac=2,initial_cells=None):
+        """Fit a PU coordinate model; optionally supersample its actual footprint.
+
+        An explicit parameter domain avoids guessing a face from its convex hull.
+        The physical feature graph remains the responsibility of the hierarchy.
+        """
+        from .parametric_pu import fit_parametric_pu,PUOptions
+        model=fit_parametric_pu(parameters,self.data_sites,
+            validation_parameters=validation_parameters,validation_positions=validation_positions,
+            validation_normals=validation_normals,options=options or PUOptions(),
+            initial_cells=initial_cells,
+            parameter_bounds=None if outlines is None else (np.asarray(outlines[0]).min(axis=0),np.asarray(outlines[0]).max(axis=0)))
+        self.geom_model=dict(type="parametric-pu",degree=3,model=model,
+            polynomial_basis_terms=self.surf_dim+1,input_parameters=jnp.asarray(parameters),
+            outlines=outlines,normal_sign=1.)
+        self.geom_model['fit_context']=dict(outlines=outlines,radius=radius,
+            validation_parameters=validation_parameters,validation_positions=validation_positions,
+            validation_normals=validation_normals,options=options,seed=seed,backend=backend,supersample_fac=supersample_fac)
+        if radius is None:
+            # Bounding-box PCA needs at least the ambient dimension in rows.
+            # Fit-only builds avoid the full node cloud but retain enough small
+            # evaluation samples for the geometry object's metadata.
+            params=jnp.asarray(parameters)[:self.surf_dim+1]
+        else:
+            if outlines is None:
+                raise ValueError("PU sampling requires a parameter footprint")
+            from kernelpack.nodes.hierarchical import sample_parametric_face,sample_parametric_curve
+            if self.surf_dim==1:
+                params=sample_parametric_curve(model,outlines,float(radius),supersample_fac=supersample_fac)
+            else:
+                params=sample_parametric_face(model,outlines,float(radius),seed=seed,
+                    backend=backend,supersample_fac=supersample_fac)
+            self.sep_rad=float(radius)
+        self.set_sample_sites(model.evaluate(params))
+        _,self.nrmls=model.frame(params)
+        if not bool(jnp.all(jnp.isfinite(self.sample_sites))) or not bool(jnp.all(jnp.isfinite(self.nrmls))):
+            raise ValueError("PU model does not cover the physical parameter footprint")
+        self.uniform_sample_sites=self.sample_sites; self.uniform_nrmls=self.nrmls
+        self.compute_bounding_box()
+
+    def build_spherical_pu_model(self, data, *, radius=None, seed=0, supersample_fac=2, initial_cover=None):
+        """Fit a closed piece over S^{d-1} by the spherical-cap partition of unity (spherical_pu.py) and,
+        given a radius, supersample it; piecewise assembly thins the samples in physical space.
+
+        data: spherical_pu.ClosedSurfaceData. The piece has no trimming loops (outlines=None), hence no
+        features. Its normals point away from the center of the parameterization; flip_normals reverses them.
+        """
+        from .spherical_pu import fit_spherical_pu, sample_sphere_piece
+        self.set_data_sites(data.positions)
+        model = fit_spherical_pu(data.directions, data.positions,
+            validation_directions=data.validation_directions, validation_positions=data.validation_positions,
+            validation_normals=data.validation_normals, options=data.options, initial_cover=initial_cover)
+        self.geom_model = dict(type="spherical-pu", degree=3, model=model, outlines=None, normal_sign=1.,
+            input_parameters=jnp.asarray(data.directions), data=data,
+            fit_context=dict(radius=radius, seed=seed, supersample_fac=supersample_fac))
+        if radius is None:
+            params = jnp.asarray(data.directions)[: self.surf_dim + 2]
+        else:
+            params = sample_sphere_piece(model, float(radius), seed=seed, supersample_fac=supersample_fac)
+            self.sep_rad = float(radius)
+        self.set_sample_sites(model.evaluate(params))
+        _, self.nrmls = model.frame(params)
+        if not bool(jnp.all(jnp.isfinite(self.sample_sites))) or not bool(jnp.all(jnp.isfinite(self.nrmls))):
+            raise ValueError("spherical PU model produced nonfinite samples")
+        self.uniform_sample_sites = self.sample_sites; self.uniform_nrmls = self.nrmls
+        self.compute_bounding_box()
 
     def get_n(self) -> int:
         return self.n
@@ -1431,9 +1571,16 @@ class PiecewiseSmoothEmbeddedSurface:
     nrmls_uniform: jnp.ndarray = field(default_factory=lambda: jnp.zeros((0, 0)))
     segment_map: jnp.ndarray = field(default_factory=lambda: jnp.zeros(0, dtype=int))
     corner_flags: jnp.ndarray = field(default_factory=lambda: jnp.zeros(0, dtype=float))
+    feature_sites: jnp.ndarray = field(default_factory=lambda: jnp.zeros((0, 3)))
+    feature_normals: jnp.ndarray = field(default_factory=lambda: jnp.zeros((0, 3)))
+    feature_priorities: jnp.ndarray = field(default_factory=lambda: jnp.zeros(0, dtype=int))
     level_set: RBFLevelSet = field(default_factory=RBFLevelSet)
     cbox: dict[str, jnp.ndarray] = field(default_factory=dict)
     ubox: dict[str, jnp.ndarray] = field(default_factory=dict)
+    sep_rad: float = 0.
+    assembly_options: dict = field(default_factory=dict)
+    seed: int = 0   # seed of the random samplers that built this surface (feature enrichment reuses it)
+    derived_features: tuple = ()
 
     def set_segments(self, segments: list[EmbeddedSurface]) -> None:
         self.segments = list(segments)
@@ -1450,13 +1597,33 @@ class PiecewiseSmoothEmbeddedSurface:
         smooth_normals: bool = False,
         smooth_neighborhood: int = 0,
     ) -> None:
+        from .parametric_pu import ParametricSurfaceData
+        from .spherical_pu import ClosedSurfaceData
         self.segments = []
-        radii = _normalize_piecewise_radii(radius, jnp.asarray(bdry_segments[0]).shape[1])
+        raw=[item.positions if isinstance(item,(ParametricSurfaceData,ClosedSurfaceData)) else item for item in bdry_segments]
+        radii = _normalize_piecewise_radii(radius, jnp.asarray(raw[0]).shape[1])
         min_radius = float(jnp.min(radii))
         build_radius: float | jnp.ndarray = radii if int(bdry_mode) != 0 and radii.size > 1 else min_radius
-        dim = jnp.asarray(bdry_segments[0]).shape[1]
-        for seg_pts, flip in zip(bdry_segments, flip_normal):
-            self.segments.append(self._build_segment(jnp.asarray(seg_pts, dtype=float), bool(flip), dim, min_radius, build_radius, method, supersample_fac))
+        dim = jnp.asarray(raw[0]).shape[1]
+        for index, (seg_pts, flip) in enumerate(zip(bdry_segments, flip_normal)):
+            if isinstance(seg_pts,ClosedSurfaceData):
+                if not bool(jnp.all(radii==radii[0])):
+                    raise ValueError('PU pieces currently require isotropic physical sampling')
+                seg=EmbeddedSurface()
+                seg.build_spherical_pu_model(seg_pts,radius=min_radius,seed=int(self.seed)+index,supersample_fac=supersample_fac)
+                if flip: seg.flip_normals()
+                self.segments.append(seg)
+            elif isinstance(seg_pts,ParametricSurfaceData):
+                if not bool(jnp.all(radii==radii[0])):
+                    raise ValueError('PU pieces currently require isotropic physical sampling')
+                seg=EmbeddedSurface(); seg.set_data_sites(seg_pts.positions)
+                seg.build_parametric_pu_model(seg_pts.parameters,outlines=seg_pts.outlines,radius=min_radius,
+                    validation_parameters=seg_pts.validation_parameters,validation_positions=seg_pts.validation_positions,
+                    validation_normals=seg_pts.validation_normals,options=seg_pts.options,supersample_fac=supersample_fac)
+                if flip: seg.flip_normals()
+                self.segments.append(seg)
+            else:
+                self.segments.append(self._build_segment(jnp.asarray(seg_pts, dtype=float), bool(flip), dim, min_radius, build_radius, method, supersample_fac))
         self._assemble_boundary(min_radius, smooth_normals, smooth_neighborhood, use_uniform=bool(int(bdry_mode) != 0 and radii.size > 1))
 
     def generate_piecewise_smooth_surface_by_segment_with_omission(
@@ -1514,46 +1681,116 @@ class PiecewiseSmoothEmbeddedSurface:
         return seg
 
     def _assemble_boundary(self, radius: float, smooth_normals: bool, smooth_neighborhood: int, use_uniform: bool = False) -> None:
-        xb = jnp.vstack([seg.get_sample_sites() for seg in self.segments])
-        nr = jnp.vstack([seg.get_nrmls() for seg in self.segments])
-        segment_map = jnp.concatenate([jnp.full(seg.get_sample_sites().shape[0], k, dtype=int) for k, seg in enumerate(self.segments)])
-        corner_flags = []
-        for seg in self.segments:
-            flags = jnp.zeros(seg.get_sample_sites().shape[0], dtype=float)
-            if flags.shape[0] > 0:
-                flags = flags.at[0].set(1.0)
-                flags = flags.at[-1].set(1.0)
-            corner_flags.append(flags)
-        corner = jnp.concatenate(corner_flags)
-        keep = _assembled_boundary_keep_mask(xb, corner, float(radius))
-        self.xb = xb[keep]
-        self.nrmls = nr[keep]
-        self.segment_map = segment_map[keep]
-        self.corner_flags = corner[keep]
+        self.sep_rad=float(radius)
+        self.assembly_options=dict(smooth_normals=smooth_normals,smooth_neighborhood=smooth_neighborhood,use_uniform=use_uniform)
+        # Host bookkeeping (concatenation, flags) is plain numpy: per-segment
+        # eager device ops compile once per distinct shape. Thinning is on device.
+        def gather(sites_of, normals_of):
+            xb = np.vstack([np.asarray(sites_of(seg), dtype=float) for seg in self.segments])
+            nr = np.vstack([np.asarray(normals_of(seg), dtype=float) for seg in self.segments])
+            seg_map = np.concatenate([np.full(len(np.asarray(sites_of(seg))), k, dtype=int) for k, seg in enumerate(self.segments)])
+            # Samples on the pieces have priority 0; features come first (below).
+            return xb, nr, seg_map, np.zeros(len(xb), dtype=float)
+
+        xb, nr, segment_map, corner = gather(lambda s: s.get_sample_sites(), lambda s: s.get_nrmls())
+        if self.feature_sites.shape[0]:
+            features = np.asarray(self.feature_sites, dtype=float)
+            normals = np.asarray(self.feature_normals, dtype=float)
+            priorities = np.asarray(self.feature_priorities, dtype=int)
+        else:
+            # Features derived from the mapped trimming loops (geometry/features.py).
+            from .features import derive_features
+            features, normals, priorities = derive_features(self.segments, radius)
+        self.derived_features = (features, normals, priorities)
+        if len(features):
+            if features.shape != normals.shape or priorities.shape != (features.shape[0],):
+                raise ValueError("feature sites, normals and priorities must have matching shapes")
+            if (features.shape[1] != xb.shape[1] or not np.all(np.isfinite(normals))
+                    or not np.all(np.isfinite(features)) or np.any(priorities <= 0)):
+                raise ValueError("features need matching dimensions, finite coordinates/normals and positive priorities")
+            if np.any(np.linalg.norm(normals, axis=1) == 0):
+                raise ValueError("feature normals must be nonzero")
+            # Larger feature priorities precede smaller ones, before face points (0).
+            # This also makes duplicate elimination respect feature priority.
+            order = np.argsort(-priorities, kind="stable")
+            feature_normals = normals[order] / np.linalg.norm(normals[order], axis=1)[:, None]
+            xb = np.vstack([features[order], xb])
+            nr = np.vstack([feature_normals, nr])
+            segment_map = np.concatenate([np.full(len(features), -1, dtype=int), segment_map])
+            corner = np.concatenate([priorities[order].astype(float), corner])
+        keep = np.asarray(_assembled_boundary_keep_mask(xb, corner, float(radius)))
+        self.xb = jnp.asarray(xb[keep])
+        self.nrmls = jnp.asarray(nr[keep])
+        self.segment_map = jnp.asarray(segment_map[keep])
+        self.corner_flags = jnp.asarray(corner[keep])
         if use_uniform:
-            xb_uniform = jnp.vstack([seg.get_uniform_sample_sites() for seg in self.segments])
-            nr_uniform = jnp.vstack([seg.get_uniform_nrmls() for seg in self.segments])
-            uniform_corner_flags = []
-            for seg in self.segments:
-                flags = jnp.zeros(seg.get_uniform_sample_sites().shape[0], dtype=float)
-                if flags.shape[0] > 0:
-                    flags = flags.at[0].set(1.0)
-                    flags = flags.at[-1].set(1.0)
-                uniform_corner_flags.append(flags)
-            uniform_corner = jnp.concatenate(uniform_corner_flags)
-            keep_uniform = _assembled_boundary_keep_mask(xb_uniform, uniform_corner, float(radius))
-            self.xb_uniform = xb_uniform[keep_uniform]
-            self.nrmls_uniform = nr_uniform[keep_uniform]
+            xb_uniform, nr_uniform, _, uniform_corner = gather(lambda s: s.get_uniform_sample_sites(), lambda s: s.get_uniform_nrmls())
+            if len(features):
+                xb_uniform = np.vstack([features[order], xb_uniform])
+                nr_uniform = np.vstack([feature_normals, nr_uniform])
+                uniform_corner = np.concatenate([priorities[order].astype(float), uniform_corner])
+            keep_uniform = np.asarray(_assembled_boundary_keep_mask(xb_uniform, uniform_corner, float(radius)))
+            self.xb_uniform = jnp.asarray(xb_uniform[keep_uniform])
+            self.nrmls_uniform = jnp.asarray(nr_uniform[keep_uniform])
+            uniform_corner = jnp.asarray(uniform_corner)
         else:
             self.xb_uniform = self.xb
             self.nrmls_uniform = self.nrmls
         if smooth_normals and smooth_neighborhood > 1:
-            self.nrmls = self._smooth_normals(self.xb, self.nrmls, smooth_neighborhood)
-            self.nrmls_uniform = self.nrmls
+            smoothed = self._smooth_normals(self.xb, self.nrmls, smooth_neighborhood)
+            self.nrmls = jnp.where((self.corner_flags > 0)[:, None], self.nrmls, smoothed)
+            if use_uniform:
+                uniform_smoothed = self._smooth_normals(self.xb_uniform, self.nrmls_uniform, smooth_neighborhood)
+                self.nrmls_uniform = jnp.where((uniform_corner[keep_uniform] > 0)[:, None],
+                                               self.nrmls_uniform, uniform_smoothed)
+            else:
+                self.nrmls_uniform = self.nrmls
 
-    def build_level_set(self) -> None:
+    def build_level_set(self,method=None,*,options=None) -> None:
         self.level_set = RBFLevelSet()
-        self.level_set.build_level_set_from_cfi(self.xb_uniform, self.nrmls_uniform)
+        if method is None:
+            kinds=[seg.geom_model.get('type') for seg in self.segments]
+            method='cfpu' if ('parametric-pu' in kinds or 'spherical-pu' in kinds or all(kind=='affine-face' for kind in kinds)) else 'cfi'
+        if method=='cfpu':
+            from .cfpu import CFPUOptions,CFPUCoverError
+            from .parametric_pu import refine_cover_cells,PUOptions
+            options=options or CFPUOptions(); history=[]
+            for iteration in range(options.max_cover_refinements+1):
+                try:
+                    from .feature_sampling import feature_graded_cfpu_sites
+                    fit,nr,sampling=feature_graded_cfpu_sites(self,factor=options.feature_grade_factor,
+                        bandwidth=options.feature_bandwidth,seed=int(self.seed),backend='gpu')
+                    self.level_set.build_level_set_from_cfpu(self.segments,fit,nr,options=options)
+                    self.level_set.cfpu_model.diagnostics['shared_refinement_history']=history
+                    self.level_set.cfpu_model.diagnostics['feature_sampling']=sampling
+                    break
+                except CFPUCoverError as error:
+                    if iteration==options.max_cover_refinements or not error.parent_patches: raise
+                    history.append(dict(iteration=iteration,reason=str(error),requested_parents=error.parent_patches))
+                    for piece in sorted(set(p for p,_ in error.parent_patches)):
+                        segment=self.segments[piece]; model=segment.geom_model
+                        indices={patch for p,patch in error.parent_patches if p==piece}
+                        if model['type']=='spherical-pu':
+                            from .spherical_pu import split_caps
+                            pu=model['model']; cover=split_caps(np.asarray(pu.centers),np.asarray(pu.betas),indices)
+                            sign=model.get('normal_sign',1.); context=model['fit_context']
+                            segment.build_spherical_pu_model(model['data'],initial_cover=cover,**context)
+                            if sign<0: segment.flip_normals()
+                        elif model['type']=='parametric-pu':
+                            cells=refine_cover_cells(model['model'].cells,indices)
+                            sign=model.get('normal_sign',1.); parameters=model['input_parameters']; context=model['fit_context']
+                            segment.build_parametric_pu_model(parameters,initial_cells=cells,**context)
+                            if sign<0: segment.flip_normals()
+                        else:
+                            cells=refine_cover_cells(model['cover_cells'],indices)
+                            if len(cells)>PUOptions().max_patches: raise ValueError('shared affine cover exceeded max_patches')
+                            model['cover_cells']=cells
+                            model['cover_centers']=np.array([(a+b)/2 for a,b in cells])
+                            model['cover_widths']=np.array([(b-a)*PUOptions().overlap/2 for a,b in cells])
+                    self._assemble_boundary(self.sep_rad,**self.assembly_options)
+        elif method=='cfi':
+            self.level_set.build_level_set_from_cfi(self.xb_uniform, self.nrmls_uniform)
+        else: raise ValueError('level-set method must be cfpu or cfi')
 
     def compute_bounding_box(self) -> None:
         self.cbox = pca_oriented_bounding_box(self.xb)
@@ -1613,16 +1850,29 @@ def _normalize_piecewise_radii(radius: float | jnp.ndarray, dim: int) -> jnp.nda
 
 
 def _assembled_boundary_keep_mask(x: jnp.ndarray, corner_flags: jnp.ndarray, radius: float) -> jnp.ndarray:
-    pts = jnp.asarray(x, dtype=float)
-    corners = jnp.asarray(corner_flags, dtype=float).reshape(-1)
-    if pts.shape[0] == 0:
+    """Greedy spacing thinning in priority order (larger corner flag first, then input order).
+
+    Computed as the lexicographically first independent set of the conflict
+    graph ``|x_i - x_j| < radius*(1-1e-12)`` in parallel rounds on the device;
+    identical to the sequential pass in ``_assembled_boundary_keep_mask_impl``.
+    """
+    from kernelpack.accelerators.jax_spatial import bucket, conflict_lists, greedy_independent_set, pad_rows
+    pts = np.asarray(x, dtype=float)
+    corners = np.asarray(corner_flags, dtype=float).reshape(-1)
+    n = pts.shape[0]
+    if n == 0:
         return jnp.zeros(0, dtype=bool)
-    if warp_available():
-        try:
-            return _assembled_boundary_keep_mask_warp(pts, corners, float(radius))
-        except WarpUnavailableError:
-            pass
-    return _assembled_boundary_keep_mask_impl(pts, corners, float(radius))
+    if radius <= 0:
+        return jnp.ones(n, dtype=bool)
+    order = np.argsort(-corners, kind="stable")
+    n_pad = bucket(n)
+    rank = np.arange(n_pad, dtype=np.int64)
+    rank[order] = np.arange(n)
+    valid = pad_rows(np.ones(n, bool), n_pad, False)
+    neighbors = conflict_lists(pad_rows(pts, n_pad, 0.0), pad_rows(np.full(n, float(radius)), n_pad, 0.0), valid,
+                               scale=1.0 - 1.0e-12)
+    keep, _ = greedy_independent_set(neighbors, rank, excluded=~valid)
+    return jnp.asarray(np.asarray(keep)[:n])
 
 
 def _assembled_boundary_keep_mask_warp(x: jnp.ndarray, corner_flags: jnp.ndarray, radius: float) -> jnp.ndarray:
@@ -1637,29 +1887,17 @@ def _assembled_boundary_keep_mask_impl(x: jnp.ndarray, corner_flags: jnp.ndarray
     n = x.shape[0]
     idx = jnp.arange(n)
     d = distance_matrix(x, x)
-    duplicate_tol = 0.2 * radius
-    keep0 = jnp.ones(n, dtype=bool)
+    order = jnp.argsort(-corner_flags, stable=True)
+    spacing_tol = radius * (1.0 - 1.0e-12)
 
-    def duplicate_body(i: int, keep: jnp.ndarray) -> jnp.ndarray:
-        close = (d[i] < duplicate_tol) & (idx != i) & keep
+    def spacing_body(pos, keep):
+        i = order[pos]
+        close = (d[i] < spacing_tol) & (idx != i)
         return jnp.where(keep[i], keep & ~close, keep)
 
-    keep = lax.fori_loop(0, n, duplicate_body, keep0)
-    spacing_tol = radius * (1.0 - 1.0e-12)
-    corner_active = corner_flags != 0.0
-    order = jnp.argsort(jnp.where(corner_active, 0, 1), stable=True)
-
-    def spacing_body(pos: int, keep_in: jnp.ndarray) -> jnp.ndarray:
-        i = order[pos]
-        close = (d[i] < spacing_tol) & (idx != i) & keep_in
-        current_corner = corner_active[i]
-        current_loses = keep_in[i] & (~current_corner) & jnp.any(close & corner_active)
-        remove_close = keep_in & ~close
-        remove_current = keep_in.at[i].set(False)
-        updated = jnp.where(current_loses, remove_current, remove_close)
-        return jnp.where(keep_in[i], updated, keep_in)
-
-    return lax.fori_loop(0, n, spacing_body, keep)
+    # One pass avoids pre-eliminating candidates in a duplicate pass and then
+    # removing their winners during spacing, which leaves avoidable holes.
+    return lax.fori_loop(0, n, spacing_body, jnp.ones(n, dtype=bool))
 
 
 @partial(jit, static_argnums=(2,))

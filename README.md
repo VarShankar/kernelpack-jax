@@ -309,6 +309,37 @@ correspond to the components used in your work.
 | Moving-domain ADR and matrix updates | V. Shankar, G. B. Wright, and A. L. Fogelson, [*An efficient high-order meshless method for advection-diffusion equations on time-varying irregular domains*](https://doi.org/10.1016/j.jcp.2021.110633), Journal of Computational Physics 445 (2021), 110633 |
 | Lagrangian-Eulerian moving-surface ADR | M. Lowery, G. B. Wright, and V. Shankar, [*A high-order, meshless, Lagrangian--Eulerian RBF-FD method for advection--diffusion--reaction on moving manifolds*](https://doi.org/10.48550/arXiv.2608.19384), arXiv:2608.19384 (2026) |
 
+## GPU sparse direct solves
+
+The paper pipeline factors its sparse systems with NVIDIA cuDSS through a small JAX FFI extension
+(`src/kernelpack/sparse/_native/cudss_ffi.cc`). On Linux or WSL with the CUDA Toolkit and cuDSS
+installed, build it once with
+
+```bash
+python -m kernelpack.sparse.build_cudss --cudss-root /path/to/cudss
+```
+
+which writes `src/kernelpack/sparse/_cudss_ffi.so` (or set `KERNELPACK_CUDSS_LIBRARY` to a built
+library). The rest of the package runs without it.
+
+## Reproducing the KernelPack-JAX paper
+
+`scripts/paper/reproduce.sh` regenerates every node set, forward and inverse result, table, and
+figure of the KernelPack-JAX paper (stacked boundary representation, GPU node generation, and
+differentiable high-order RBF-FD). It needs an NVIDIA GPU, the cuDSS extension above, and the
+`paper` extras:
+
+```bash
+python -m pip install -e .[paper,warp]
+PYTHON=python bash scripts/paper/reproduce.sh            # all stages
+PYTHON=python bash scripts/paper/reproduce.sh clouds     # a single stage
+```
+
+The stages are `clouds`, `forward`, `euclid`, `estimate`, `inverse`, `obstacle`, `geometry`,
+`stats`, and `figures`; results are written to `Outputs_and_results/`, the LaTeX tables to
+`KernelPackJaxPaper/`, and the plot data to `Outputs_and_results/paper_figures/plot_data.json`,
+from which `scripts/matlab/paper_plots.m` draws the figures.
+
 ## Project status
 
 KernelPack is research software. The public API is usable and tested, but the

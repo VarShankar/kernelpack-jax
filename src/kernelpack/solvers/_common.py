@@ -1,17 +1,20 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import comb
 from typing import Callable
+import time
+import warnings
 
 from functools import partial
 
+import jax
 from jax import jit, lax, vmap
 from jax import scipy as jsp
 import jax.numpy as jnp
 import numpy as np
 from scipy.sparse import coo_matrix
-from scipy.sparse.linalg import spilu
+from scipy.sparse.linalg import LinearOperator, gmres as scipy_gmres, spilu, splu
 
 from kernelpack.domain import DomainDescriptor
 from kernelpack.rbffd import FDODiffOp, FDDiffOp, FrozenStencilGraph, RBFStencil, StencilProperties, WeightedLeastSquaresStencil, build_frozen_stencil_graph
@@ -41,27 +44,62 @@ class SparseCOOMatrix:
 
 @dataclass(frozen=True)
 class FrozenILUPreconditioner:
-    """Host-built, device-applied preconditioner for traced sparse solves.
+    """Frozen setup-time preconditioner for traced sparse solves.
 
     The ILU factorization itself is intentionally a setup-time CPU operation
-    through SciPy.  The resulting approximate inverse matrices are frozen with
-    `lax.stop_gradient` and used only as fixed JAX arrays inside GMRES and its
-    transpose solve.
+    through SciPy. Small cases can materialize dense approximate inverse
+    matrices on-device. Large forward-only cases can instead keep the SuperLU
+    object on the host and apply it through a callback to avoid dense N-by-N
+    storage.
     """
 
-    apply_matrix: jnp.ndarray
-    transpose_apply_matrix: jnp.ndarray
+    apply_matrix: jnp.ndarray | None
+    transpose_apply_matrix: jnp.ndarray | None
+    host_ilu: object | None = None
+    host_row_scaling: np.ndarray | None = None
+    application: str = "dense"
     drop_tol: float = 1e-4
     fill_factor: float = 10.0
+
+    def apply(self, x: jnp.ndarray, *, transpose: bool = False) -> jnp.ndarray:
+        if self.application == "diagonal":
+            if self.apply_matrix is None:
+                raise ValueError("diagonal preconditioner is missing its inverse diagonal")
+            return self.apply_matrix * x
+        if self.application == "host_callback":
+            if self.host_ilu is None:
+                raise ValueError("host_callback ILU preconditioner is missing its host factorization")
+
+            result_shape = jax.ShapeDtypeStruct(x.shape, x.dtype)
+
+            def callback(x_host: np.ndarray) -> np.ndarray:
+                solve_mode = "T" if transpose else "N"
+                x_array = np.asarray(x_host, dtype=np.float64)
+                if transpose:
+                    out = self.host_ilu.solve(x_array, solve_mode)
+                    if self.host_row_scaling is not None:
+                        out = self.host_row_scaling * out
+                else:
+                    if self.host_row_scaling is not None:
+                        x_array = self.host_row_scaling * x_array
+                    out = self.host_ilu.solve(x_array, solve_mode)
+                return np.asarray(out, dtype=np.asarray(x_host).dtype)
+
+            return jax.pure_callback(callback, result_shape, x, vmap_method="sequential")
+
+        matrix = self.transpose_apply_matrix if transpose else self.apply_matrix
+        if matrix is None:
+            raise ValueError("dense ILU preconditioner is missing its apply matrix")
+        return matrix @ x
 
 
 def _normalize_node_values(values: jnp.ndarray | float, row_count: int, label: str) -> jnp.ndarray:
     arr = jnp.asarray(values, dtype=float)
     if arr.ndim == 0:
-        return jnp.full((row_count,), float(arr))
+        return jnp.broadcast_to(arr, (row_count,))
     if arr.ndim == 1:
         if arr.size == 1:
-            return jnp.full((row_count,), float(arr[0]))
+            return jnp.broadcast_to(arr[0], (row_count,))
         if arr.size != row_count:
             raise ValueError(f"{label} values must match the node count")
         return arr
@@ -152,6 +190,88 @@ def build_fixed_discretization(
     )
 
 
+def build_boundary_paired_ghost_stencil_graph(
+    domain: DomainDescriptor,
+    bc_stencil_properties: StencilProperties,
+    *,
+    active_rows: jnp.ndarray | None = None,
+) -> FrozenStencilGraph:
+    """Build a boundary stencil graph that always includes the paired ghost node.
+
+    KernelPack domains are ordered as [interior; boundary; ghost]. This helper is
+    an opt-in diagnostic/experimental closure for ghost-node systems: each
+    boundary row keeps the standard nearest-neighbor stencil except that, if its
+    paired ghost point was not selected, the farthest selected neighbor is
+    replaced by that paired ghost point.
+    """
+
+    domain.build_structs()
+    point_set = StencilProperties.normalize_point_set(bc_stencil_properties.point_set)
+    tree_mode = StencilProperties.normalize_tree_mode(bc_stencil_properties.tree_mode)
+    if point_set != "boundary":
+        raise ValueError("paired ghost stencil graph is only defined for boundary-row operators")
+    if tree_mode != "all":
+        raise ValueError("paired ghost stencil graph requires tree_mode='all' so ghost nodes can be selected")
+
+    nb = int(domain.get_num_bdry_nodes())
+    nf = int(domain.get_num_total_nodes())
+    n_phys = int(domain.get_num_int_bdry_nodes())
+    if nb <= 0:
+        return FrozenStencilGraph(
+            tree_mode=tree_mode,
+            point_set=point_set,
+            stencil_size=0,
+            active_rows=jnp.zeros((0,), dtype=int),
+            knn_indices=jnp.zeros((0, 0), dtype=int),
+            periodic_bounds=domain.periodic_bounds,
+            periodic_dims=domain.periodic_dims,
+        )
+    if nf - n_phys < nb:
+        raise ValueError("paired ghost stencil graph requires at least one ghost node per boundary node")
+
+    if active_rows is None:
+        active_rows = jnp.arange(1, nb + 1, dtype=int)
+    active_rows_np = np.asarray(active_rows, dtype=np.int64).reshape(-1)
+    if np.any(active_rows_np < 1) or np.any(active_rows_np > nb):
+        raise ValueError("boundary active rows are out of range")
+
+    centers = domain.get_bdry_nodes()[jnp.asarray(active_rows_np, dtype=int) - 1]
+    knn_indices, _ = domain.query_knn(tree_mode, centers, bc_stencil_properties.n,
+        center_indices=domain.tree_indices_for_globals(tree_mode,
+            domain.get_num_interior_nodes()+jnp.asarray(active_rows_np,dtype=int)))
+    knn_np = np.asarray(knn_indices, dtype=np.int64) + 1
+
+    stencil_globals = np.asarray(domain.get_tree_globals(tree_mode), dtype=np.int64)
+    global_to_tree_local = {int(global_id): i + 1 for i, global_id in enumerate(stencil_globals)}
+    paired_global_ids = n_phys + active_rows_np
+    paired_tree_indices = np.asarray(
+        [global_to_tree_local[int(global_id)] for global_id in paired_global_ids],
+        dtype=np.int64,
+    )
+
+    replaced = 0
+    for row, paired_tree_index in enumerate(paired_tree_indices):
+        if paired_tree_index not in knn_np[row]:
+            knn_np[row, -1] = paired_tree_index
+            replaced += 1
+    if replaced:
+        print(
+            "[assembly] paired ghost boundary stencil graph: "
+            f"replaced_farthest_neighbors={replaced}/{len(active_rows_np)}, stencil_size={knn_np.shape[1]}",
+            flush=True,
+        )
+
+    return FrozenStencilGraph(
+        tree_mode=tree_mode,
+        point_set=point_set,
+        stencil_size=int(knn_np.shape[1]),
+        active_rows=jnp.asarray(active_rows_np, dtype=int),
+        knn_indices=jnp.asarray(knn_np, dtype=int),
+        periodic_bounds=domain.periodic_bounds,
+        periodic_dims=domain.periodic_dims,
+    )
+
+
 def assemble_operator(
     domain: DomainDescriptor,
     assembler_spec: str,
@@ -188,21 +308,162 @@ def assemble_operator_sparse(
     neu_coeff: jnp.ndarray | None = None,
     dir_coeff: jnp.ndarray | None = None,
     stencil_graph: FrozenStencilGraph | None = None,
+    chunk_size: int | None = None,
 ) -> SparseCOOMatrix:
+    if chunk_size is not None and int(chunk_size) > 0:
+        return assemble_operator_sparse_chunked(
+            domain,
+            assembler_spec,
+            stencil_spec,
+            op_name,
+            stencil_properties,
+            op_properties,
+            neu_coeff=neu_coeff,
+            dir_coeff=dir_coeff,
+            stencil_graph=stencil_graph,
+            chunk_size=int(chunk_size),
+        )
     assembler = make_assembler(assembler_spec, stencil_spec)
+    sparse_op_properties = replace(op_properties, sparse_only=True) if hasattr(op_properties, "sparse_only") else op_properties
     assembler.assemble_op(
         domain,
         op_name,
         stencil_properties,
-        op_properties,
+        sparse_op_properties,
         neu_coeff=neu_coeff,
         dir_coeff=dir_coeff,
         stencil_graph=stencil_graph,
     )
+    indices = np.asarray(assembler.locations, dtype=np.int64) - 1
+    values = np.asarray(assembler.values, dtype=np.float64)
     return SparseCOOMatrix(
-        indices=jnp.asarray(assembler.locations - 1, dtype=int),
-        values=jnp.asarray(assembler.values, dtype=float),
+        indices=jnp.asarray(indices, dtype=int),
+        values=jnp.asarray(values, dtype=float),
         shape=(int(assembler.n1), int(assembler.n2)),
+    )
+
+
+def _slice_stencil_graph(stencil_graph: FrozenStencilGraph, start: int, stop: int) -> FrozenStencilGraph:
+    return FrozenStencilGraph(
+        tree_mode=stencil_graph.tree_mode,
+        point_set=stencil_graph.point_set,
+        stencil_size=stencil_graph.stencil_size,
+        active_rows=stencil_graph.active_rows[start:stop],
+        knn_indices=stencil_graph.knn_indices[start:stop],
+        periodic_bounds=stencil_graph.periodic_bounds,
+        periodic_dims=stencil_graph.periodic_dims,
+    )
+
+
+def assemble_operator_sparse_chunked(
+    domain: DomainDescriptor,
+    assembler_spec: str,
+    stencil_spec: str | Callable[[], object],
+    op_name: str,
+    stencil_properties: StencilProperties,
+    op_properties: object,
+    *,
+    neu_coeff: jnp.ndarray | None = None,
+    dir_coeff: jnp.ndarray | None = None,
+    stencil_graph: FrozenStencilGraph | None = None,
+    chunk_size: int,
+) -> SparseCOOMatrix:
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be positive")
+    if stencil_graph is None:
+        center_points = domain.get_int_bdry_nodes()
+        point_set = StencilProperties.normalize_point_set(stencil_properties.point_set)
+        if point_set == "all":
+            center_count = int(domain.get_num_total_nodes())
+        elif point_set == "interior_boundary":
+            center_count = int(domain.get_num_int_bdry_nodes())
+        elif point_set == "boundary":
+            center_count = int(domain.get_num_bdry_nodes())
+        else:
+            center_count = int(center_points.shape[0])
+        row_count = center_count
+        graph_mode = "incremental_knn"
+    else:
+        row_count = int(stencil_graph.active_rows.shape[0])
+        graph_mode = "supplied"
+
+    index_chunks: list[np.ndarray] = []
+    value_chunks: list[np.ndarray] = []
+    n1 = 0
+    n2 = 0
+    sparse_op_properties = replace(op_properties, sparse_only=True) if hasattr(op_properties, "sparse_only") else op_properties
+    chunk_count = (row_count + chunk_size - 1) // chunk_size
+    print(
+        "[assembly] chunked sparse assembly start: "
+        f"op={op_name}, point_set={stencil_properties.point_set}, tree_mode={stencil_properties.tree_mode}, "
+        f"rows={row_count}, stencil_size={stencil_properties.n}, chunk_size={chunk_size}, chunks={chunk_count}, "
+        f"graph_mode={graph_mode}",
+        flush=True,
+    )
+    assembly_start = time.perf_counter()
+    for start in range(0, row_count, chunk_size):
+        stop = min(start + chunk_size, row_count)
+        chunk_index = start // chunk_size + 1
+        chunk_start = time.perf_counter()
+        chunk_rows = stop - start
+        augmented_size = int(stencil_properties.n + stencil_properties.npoly)
+        lhs_mib = chunk_rows * augmented_size * augmented_size * 8 / (1024**2)
+        print(
+            "[assembly] chunk start: "
+            f"op={op_name}, chunk={chunk_index}/{chunk_count}, rows={start}:{stop}, "
+            f"chunk_rows={chunk_rows}, stencil_size={stencil_properties.n}, "
+            f"npoly={stencil_properties.npoly}, augmented_size={augmented_size}, "
+            f"lhs_estimate={lhs_mib:.2f}MiB",
+            flush=True,
+        )
+        if stencil_graph is None:
+            active_rows = jnp.arange(start + 1, stop + 1, dtype=int)
+            chunk_graph = build_frozen_stencil_graph(domain, stencil_properties, active_rows=active_rows)
+        else:
+            chunk_graph = _slice_stencil_graph(stencil_graph, start, stop)
+        assembler = make_assembler(assembler_spec, stencil_spec)
+        assembler.assemble_op(
+            domain,
+            op_name,
+            stencil_properties,
+            sparse_op_properties,
+            neu_coeff=neu_coeff,
+            dir_coeff=dir_coeff,
+            stencil_graph=chunk_graph,
+        )
+        n1 = max(n1, int(assembler.n1))
+        n2 = max(n2, int(assembler.n2))
+        # Materialize the solve-dependent values before locations. This blocks
+        # the current chunk and permits its temporary factorization buffers to
+        # be reclaimed before the next chunk is dispatched.
+        value_chunks.append(np.asarray(jax.device_get(assembler.values), dtype=np.float64))
+        index_chunks.append(np.asarray(jax.device_get(assembler.locations), dtype=np.int64) - 1)
+        del assembler
+        print(
+            "[assembly] chunk done: "
+            f"op={op_name}, chunk={chunk_index}/{chunk_count}, nnz={index_chunks[-1].shape[0]}, "
+            f"elapsed={time.perf_counter() - chunk_start:.3f}s",
+            flush=True,
+        )
+
+    concat_start = time.perf_counter()
+    print(f"[assembly] concatenate start: op={op_name}, chunks={chunk_count}", flush=True)
+    if index_chunks:
+        indices = np.concatenate(index_chunks, axis=0)
+        values = np.concatenate(value_chunks, axis=0)
+    else:
+        indices = np.zeros((0, 2), dtype=np.int64)
+        values = np.zeros((0,), dtype=np.float64)
+    print(
+        "[assembly] chunked sparse assembly done: "
+        f"op={op_name}, nnz={values.shape[0]}, concat_elapsed={time.perf_counter() - concat_start:.3f}s, "
+        f"total_elapsed={time.perf_counter() - assembly_start:.3f}s",
+        flush=True,
+    )
+    return SparseCOOMatrix(
+        indices=jnp.asarray(indices, dtype=int),
+        values=jnp.asarray(values, dtype=float),
+        shape=(n1, n2),
     )
 
 
@@ -398,25 +659,167 @@ def build_fixed_ilu_preconditioner(
     *,
     drop_tol: float = 1e-4,
     fill_factor: float = 10.0,
+    application: str = "dense",
 ) -> FrozenILUPreconditioner:
     """Build a frozen preconditioner outside differentiated rollouts.
 
     We prefer sparse ILU because it is cheap to factor and usually gives a good
-    approximate inverse for GMRES. If SuperLU reports a singular factorization,
-    fall back to a dense approximate inverse so the preconditioner can still be
-    used on awkward matrices.
+    approximate inverse for GMRES. The default application path materializes a
+    dense approximate inverse because that is JAX-friendly for small problems.
+    For large forward-only problems, application="host_callback" keeps the
+    SuperLU factorization on the host and applies it without dense N-by-N
+    storage.
     """
 
+    if application not in ("dense", "host_callback"):
+        raise ValueError("application must be 'dense' or 'host_callback'")
     indices = np.asarray(system.indices, dtype=np.int32)
     values = np.asarray(system.values, dtype=np.float64)
     scipy_matrix = coo_matrix((values, (indices[:, 0], indices[:, 1])), shape=system.shape).tocsc()
-    eye = np.eye(system.shape[0], dtype=values.dtype)
+    scipy_matrix.sum_duplicates()
+    scipy_matrix.eliminate_zeros()
+    scipy_matrix.sort_indices()
+    if not np.all(np.isfinite(scipy_matrix.data)):
+        raise ValueError("cannot build ILU preconditioner for a matrix containing nonfinite values")
+    row_nnz = np.diff(scipy_matrix.tocsr().indptr)
+    column_nnz = np.diff(scipy_matrix.indptr)
+    empty_rows = int(np.count_nonzero(row_nnz == 0))
+    empty_columns = int(np.count_nonzero(column_nnz == 0))
+    zero_diagonal = int(np.count_nonzero(scipy_matrix.diagonal() == 0))
+    print(
+        "[ilu] matrix diagnostics: "
+        f"shape={scipy_matrix.shape}, nnz={scipy_matrix.nnz}, "
+        f"empty_rows={empty_rows}, empty_columns={empty_columns}, "
+        f"zero_diagonal={zero_diagonal}",
+        flush=True,
+    )
+    if empty_rows or empty_columns:
+        raise ValueError(
+            "cannot build a preconditioner for a structurally singular sparse system: "
+            f"empty_rows={empty_rows}, empty_columns={empty_columns}"
+        )
+    row_maximum = np.asarray(np.abs(scipy_matrix).max(axis=1).toarray(), dtype=np.float64).reshape(-1)
+    row_scaling = 1.0 / row_maximum
+    equilibrated_matrix = scipy_matrix.multiply(row_scaling[:, None]).tocsc()
+    equilibrated_matrix.sum_duplicates()
+    equilibrated_matrix.eliminate_zeros()
+    equilibrated_matrix.sort_indices()
+    print(
+        "[ilu] row equilibration: "
+        f"scale_min={float(np.min(row_scaling)):.6e}, "
+        f"scale_max={float(np.max(row_scaling)):.6e}",
+        flush=True,
+    )
     try:
-        ilu = spilu(scipy_matrix, drop_tol=drop_tol, fill_factor=fill_factor)
+        if application == "host_callback":
+            ilu_attempts = (
+                {
+                    "drop_tol": drop_tol,
+                    "fill_factor": fill_factor,
+                },
+                {
+                    "drop_tol": min(drop_tol, 1e-6),
+                    "fill_factor": max(fill_factor, 20.0),
+                    "permc_spec": "COLAMD",
+                    "diag_pivot_thresh": 0.0,
+                },
+            )
+            ilu = None
+            failures = []
+            probe = np.random.default_rng(0).standard_normal(system.shape[1])
+            probe_rhs = equilibrated_matrix @ probe
+            for attempt_index, kwargs in enumerate(ilu_attempts, start=1):
+                try:
+                    candidate = spilu(equilibrated_matrix, **kwargs)
+                    probe_reconstruction = candidate.solve(probe_rhs)
+                    quality = float(
+                        np.linalg.norm(probe_reconstruction - probe)
+                        / max(np.linalg.norm(probe), np.finfo(np.float64).eps)
+                    )
+                    if not np.isfinite(quality) or quality > 1e2:
+                        raise RuntimeError(
+                            f"numerically unstable ILU preconditioner (probe relative error={quality:.6e})"
+                        )
+                    ilu = candidate
+                    if attempt_index > 1:
+                        print(
+                            f"[ilu] sparse retry {attempt_index}/{len(ilu_attempts)} succeeded: "
+                            f"probe_relative_error={quality:.6e}, settings={kwargs}",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"[ilu] sparse attempt 1/{len(ilu_attempts)} succeeded: "
+                            f"probe_relative_error={quality:.6e}",
+                            flush=True,
+                        )
+                    break
+                except RuntimeError as exc:
+                    failures.append(str(exc))
+                    print(
+                        f"[ilu] sparse attempt {attempt_index}/{len(ilu_attempts)} failed: {exc}",
+                        flush=True,
+                    )
+
+            if ilu is None:
+                diagonal = np.asarray(equilibrated_matrix.diagonal(), dtype=np.float64)
+                diagonal_scale = max(float(np.max(np.abs(diagonal), initial=0.0)), 1.0)
+                shifted_matrix = equilibrated_matrix.copy()
+                diagonal_shift = 1e-10 * diagonal_scale
+                shifted_matrix.setdiag(diagonal + diagonal_shift)
+                shifted_kwargs = {
+                    "drop_tol": min(drop_tol, 1e-6),
+                    "fill_factor": max(fill_factor, 20.0),
+                    "permc_spec": "COLAMD",
+                    "diag_pivot_thresh": 0.0,
+                }
+                try:
+                    ilu = spilu(shifted_matrix, **shifted_kwargs)
+                    probe_reconstruction = ilu.solve(probe_rhs)
+                    quality = float(
+                        np.linalg.norm(probe_reconstruction - probe)
+                        / max(np.linalg.norm(probe), np.finfo(np.float64).eps)
+                    )
+                    if not np.isfinite(quality) or quality > 1e2:
+                        raise RuntimeError(
+                            f"numerically unstable shifted ILU preconditioner "
+                            f"(probe relative error={quality:.6e})"
+                        )
+                    print(
+                        f"[ilu] sparse shifted retry succeeded: shift={diagonal_shift:.6e}, "
+                        f"probe_relative_error={quality:.6e}, settings={shifted_kwargs}",
+                        flush=True,
+                    )
+                except RuntimeError as exc:
+                    failures.append(str(exc))
+                    print(f"[ilu] sparse shifted retry failed: {exc}", flush=True)
+
+            if ilu is None:
+                raise RuntimeError(
+                    "Sparse ILU factorization failed after all retries; refusing to use "
+                    "the ineffective Jacobi fallback. "
+                    f"Last SuperLU error: {failures[-1]}"
+                )
+        else:
+            ilu = spilu(scipy_matrix, drop_tol=drop_tol, fill_factor=fill_factor)
+        if application == "host_callback":
+            return FrozenILUPreconditioner(
+                apply_matrix=None,
+                transpose_apply_matrix=None,
+                host_ilu=ilu,
+                host_row_scaling=row_scaling,
+                application=application,
+                drop_tol=drop_tol,
+                fill_factor=fill_factor,
+            )
+        eye = np.eye(system.shape[0], dtype=values.dtype)
         apply_matrix = np.column_stack([ilu.solve(eye[:, i]) for i in range(system.shape[0])])
         transpose_apply_matrix = np.column_stack([ilu.solve(eye[:, i], "T") for i in range(system.shape[0])])
     except RuntimeError:
+        if application == "host_callback":
+            raise
         dense_matrix = scipy_matrix.toarray()
+        eye = np.eye(system.shape[0], dtype=values.dtype)
         try:
             apply_matrix = np.linalg.solve(dense_matrix, eye)
             transpose_apply_matrix = np.linalg.solve(dense_matrix.T, eye)
@@ -426,8 +829,54 @@ def build_fixed_ilu_preconditioner(
     return FrozenILUPreconditioner(
         apply_matrix=lax.stop_gradient(jnp.asarray(apply_matrix, dtype=float)),
         transpose_apply_matrix=lax.stop_gradient(jnp.asarray(transpose_apply_matrix, dtype=float)),
+        host_ilu=None,
+        application=application,
         drop_tol=drop_tol,
         fill_factor=fill_factor,
+    )
+
+
+def build_fixed_sparse_lu_preconditioner(system: SparseCOOMatrix) -> FrozenILUPreconditioner:
+    """Build an exact row-equilibrated sparse-LU preconditioner on the host."""
+
+    indices = np.asarray(system.indices, dtype=np.int32)
+    values = np.asarray(system.values, dtype=np.float64)
+    scipy_matrix = coo_matrix(
+        (values, (indices[:, 0], indices[:, 1])),
+        shape=system.shape,
+    ).tocsc()
+    scipy_matrix.sum_duplicates()
+    scipy_matrix.eliminate_zeros()
+    scipy_matrix.sort_indices()
+    row_maximum = np.asarray(
+        np.abs(scipy_matrix).max(axis=1).toarray(),
+        dtype=np.float64,
+    ).reshape(-1)
+    if np.any(row_maximum == 0.0):
+        raise ValueError("cannot factor a sparse system containing an empty row")
+    row_scaling = 1.0 / row_maximum
+    equilibrated_matrix = scipy_matrix.multiply(row_scaling[:, None]).tocsc()
+    print(
+        "[sparse-lu-preconditioner] factorizing: "
+        f"shape={system.shape}, nnz={scipy_matrix.nnz}, "
+        f"scale_min={float(np.min(row_scaling)):.6e}, "
+        f"scale_max={float(np.max(row_scaling)):.6e}",
+        flush=True,
+    )
+    factor = splu(equilibrated_matrix, permc_spec="COLAMD")
+    print(
+        "[sparse-lu-preconditioner] ready: "
+        f"factor_nnz={int(factor.L.nnz + factor.U.nnz)}",
+        flush=True,
+    )
+    return FrozenILUPreconditioner(
+        apply_matrix=None,
+        transpose_apply_matrix=None,
+        host_ilu=factor,
+        host_row_scaling=row_scaling,
+        application="host_callback",
+        drop_tol=0.0,
+        fill_factor=0.0,
     )
 
 
@@ -504,12 +953,12 @@ def solve_sparse_system_gmres(
     def precond(x: jnp.ndarray) -> jnp.ndarray:
         if preconditioner is None:
             return x
-        return preconditioner.apply_matrix @ x
+        return preconditioner.apply(x)
 
     def transpose_precond(x: jnp.ndarray) -> jnp.ndarray:
         if preconditioner is None:
             return x
-        return preconditioner.transpose_apply_matrix @ x
+        return preconditioner.apply(x, transpose=True)
 
     def solve(operator: Callable[[jnp.ndarray], jnp.ndarray], target: jnp.ndarray) -> jnp.ndarray:
         sol, _ = jsp.sparse.linalg.gmres(
@@ -541,6 +990,187 @@ def solve_sparse_system_gmres(
 
     del vecmat #why is this being cleared?
     return lax.custom_linear_solve(matvec, rhs, solve, transpose_solve=transpose_solve, symmetric=False)
+
+
+def solve_sparse_system_scipy_gmres(
+    system: SparseCOOMatrix,
+    rhs: jnp.ndarray,
+    *,
+    guess: jnp.ndarray | None = None,
+    preconditioner: FrozenILUPreconditioner | None = None,
+    tol: float = 1e-8,
+    atol: float = 1e-10,
+    restart: int = 40,
+    maxiter: int | None = 500,
+) -> jnp.ndarray:
+    """Solve a forward-only sparse system with SciPy and report convergence."""
+
+    indices = np.asarray(system.indices, dtype=np.int32)
+    values = np.asarray(system.values, dtype=np.float64)
+    scipy_matrix = coo_matrix(
+        (values, (indices[:, 0], indices[:, 1])),
+        shape=system.shape,
+    ).tocsr()
+    scipy_matrix.sum_duplicates()
+    scipy_matrix.eliminate_zeros()
+    scipy_matrix.sort_indices()
+
+    preconditioner_operator = None
+    if preconditioner is not None:
+        if preconditioner.application == "host_callback":
+            if preconditioner.host_ilu is None:
+                raise ValueError("host_callback ILU preconditioner is missing its host factorization")
+
+            def apply_host_ilu(vector: np.ndarray) -> np.ndarray:
+                vector_host = np.asarray(vector, dtype=np.float64)
+                if preconditioner.host_row_scaling is not None:
+                    vector_host = preconditioner.host_row_scaling * vector_host
+                return preconditioner.host_ilu.solve(vector_host)
+
+            preconditioner_operator = LinearOperator(
+                system.shape,
+                matvec=apply_host_ilu,
+                dtype=np.float64,
+            )
+        elif preconditioner.application == "diagonal":
+            inverse_diagonal = np.asarray(preconditioner.apply_matrix, dtype=np.float64)
+            preconditioner_operator = LinearOperator(
+                system.shape,
+                matvec=lambda vector: inverse_diagonal * vector,
+                dtype=np.float64,
+            )
+        elif preconditioner.apply_matrix is not None:
+            apply_matrix = np.asarray(preconditioner.apply_matrix, dtype=np.float64)
+            preconditioner_operator = LinearOperator(
+                system.shape,
+                matvec=lambda vector: apply_matrix @ vector,
+                dtype=np.float64,
+            )
+
+    rhs_host = np.asarray(rhs, dtype=np.float64)
+    if rhs_host.ndim == 2:
+        columns = [
+            solve_sparse_system_scipy_gmres(
+                system,
+                jnp.asarray(rhs_host[:, column]),
+                guess=None if guess is None else jnp.asarray(guess)[:, column],
+                preconditioner=preconditioner,
+                tol=tol,
+                atol=atol,
+                restart=restart,
+                maxiter=maxiter,
+            )
+            for column in range(rhs_host.shape[1])
+        ]
+        return jnp.column_stack(columns)
+
+    guess_host = None
+    if guess is not None:
+        guess_host = np.asarray(guess, dtype=np.float64).reshape(-1)
+        if guess_host.size == 0:
+            guess_host = None
+
+    iteration_count = 0
+
+    def report_iteration(preconditioned_residual: float) -> None:
+        nonlocal iteration_count
+        iteration_count += 1
+        if iteration_count == 1 or iteration_count % 25 == 0:
+            print(
+                f"[scipy-gmres] iteration={iteration_count}, "
+                f"preconditioned_residual={float(preconditioned_residual):.6e}",
+                flush=True,
+            )
+
+    solution, info = scipy_gmres(
+        scipy_matrix,
+        rhs_host,
+        x0=guess_host,
+        rtol=tol,
+        atol=atol,
+        restart=restart,
+        maxiter=maxiter,
+        M=preconditioner_operator,
+        callback=report_iteration,
+        callback_type="pr_norm",
+    )
+    residual = scipy_matrix @ solution - rhs_host
+    relative_residual = float(np.linalg.norm(residual) / max(np.linalg.norm(rhs_host), atol))
+    print(
+        f"[scipy-gmres] done: info={info}, iterations={iteration_count}, "
+        f"relative_residual={relative_residual:.6e}",
+        flush=True,
+    )
+    if info != 0:
+        raise RuntimeError(
+            f"SciPy GMRES did not converge: info={info}, iterations={iteration_count}, "
+            f"relative_residual={relative_residual:.6e}"
+        )
+    if not np.all(np.isfinite(solution)) or not np.isfinite(relative_residual):
+        raise FloatingPointError("SciPy GMRES produced a nonfinite solution or residual")
+    if relative_residual > max(10.0 * tol, atol):
+        raise RuntimeError(
+            "SciPy GMRES reported convergence but the verified relative residual was "
+            f"{relative_residual:.6e}"
+        )
+    return jnp.asarray(solution, dtype=float)
+
+
+def solve_sparse_system_scipy_direct(
+    system: SparseCOOMatrix,
+    rhs: jnp.ndarray,
+) -> jnp.ndarray:
+    """Solve a forward-only sparse system using row-equilibrated SuperLU."""
+
+    indices = np.asarray(system.indices, dtype=np.int32)
+    values = np.asarray(system.values, dtype=np.float64)
+    scipy_matrix = coo_matrix(
+        (values, (indices[:, 0], indices[:, 1])),
+        shape=system.shape,
+    ).tocsc()
+    scipy_matrix.sum_duplicates()
+    scipy_matrix.eliminate_zeros()
+    scipy_matrix.sort_indices()
+    rhs_host = np.asarray(rhs, dtype=np.float64)
+
+    row_maximum = np.asarray(
+        np.abs(scipy_matrix).max(axis=1).toarray(),
+        dtype=np.float64,
+    ).reshape(-1)
+    if np.any(row_maximum == 0.0):
+        raise ValueError("cannot directly solve a sparse system containing an empty row")
+    row_scaling = 1.0 / row_maximum
+    equilibrated_matrix = scipy_matrix.multiply(row_scaling[:, None]).tocsc()
+    equilibrated_rhs = row_scaling[:, None] * rhs_host if rhs_host.ndim == 2 else row_scaling * rhs_host
+
+    print(
+        "[scipy-direct] factorizing row-equilibrated sparse system: "
+        f"shape={scipy_matrix.shape}, nnz={scipy_matrix.nnz}, "
+        f"scale_min={float(np.min(row_scaling)):.6e}, "
+        f"scale_max={float(np.max(row_scaling)):.6e}",
+        flush=True,
+    )
+    factor = splu(equilibrated_matrix, permc_spec="COLAMD")
+    factor_nnz = int(factor.L.nnz + factor.U.nnz)
+    print(
+        f"[scipy-direct] factorization ready: factor_nnz={factor_nnz}",
+        flush=True,
+    )
+    solution = factor.solve(equilibrated_rhs)
+    residual = scipy_matrix @ solution - rhs_host
+    relative_residual = float(np.linalg.norm(residual) / max(np.linalg.norm(rhs_host), 1e-10))
+    print(
+        f"[scipy-direct] solve done: relative_residual={relative_residual:.6e}",
+        flush=True,
+    )
+    if not np.all(np.isfinite(solution)) or not np.isfinite(relative_residual):
+        raise FloatingPointError("SciPy sparse direct solve produced a nonfinite solution or residual")
+    if relative_residual > 1e-8:
+        raise RuntimeError(
+            "SciPy sparse direct solve produced an excessive verified relative residual: "
+            f"{relative_residual:.6e}"
+        )
+    return jnp.asarray(solution, dtype=float)
 
 
 def validate_physical_state(state: jnp.ndarray, n: int) -> jnp.ndarray:

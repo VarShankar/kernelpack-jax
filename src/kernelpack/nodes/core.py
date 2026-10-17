@@ -18,6 +18,9 @@ from kernelpack.accelerators import (
 from kernelpack.domain import DomainDescriptor
 from kernelpack.geometry import EmbeddedSurface, PiecewiseSmoothEmbeddedSurface, RBFLevelSet, distance_matrix
 
+# Ghost nodes are placed at x_b + GHOST_OFFSET_FRACTION * radius * n_b.
+GHOST_OFFSET_FRACTION = 0.5
+
 
 @jit
 def _nearest_boundary_distance_impl(points: jnp.ndarray, boundary_points: jnp.ndarray) -> jnp.ndarray:
@@ -519,7 +522,14 @@ def _local_radius(point: np.ndarray, opts: dict[str, object]) -> float:
 def _boundary_rad_frac(point: np.ndarray, opts: dict[str, object]) -> float:
     if not bool(opts["has_boundary_refinement"]):
         return 1.0
-    dist = _nearest_boundary_distance_scalar(point, np.asarray(opts["boundary_points"], dtype=float))
+    boundary_tree = opts.get("_boundary_tree")
+    if boundary_tree is None:
+        from scipy.spatial import cKDTree
+
+        boundary_points = np.asarray(opts["boundary_points"], dtype=float)
+        boundary_tree = cKDTree(boundary_points)
+        opts["_boundary_tree"] = boundary_tree
+    dist = float(boundary_tree.query(point)[0])
     if dist <= float(opts["boundary_distance"]):
         return float(opts["boundary_refinement_fraction"])
     return 1.0
@@ -566,7 +576,12 @@ def _has_conflicting_neighbor(
         if exclude_active and j == active_idx:
             continue
         if pairwise:
-            threshold = max(candidate_radius, _local_radius(points[j], opts))
+            cached_radii = opts.setdefault("_accepted_point_radii", {})
+            neighbor_radius = cached_radii.get(j)
+            if neighbor_radius is None:
+                neighbor_radius = _local_radius(points[j], opts)
+                cached_radii[j] = neighbor_radius
+            threshold = max(candidate_radius, neighbor_radius)
         else:
             threshold = candidate_radius
         if np.linalg.norm(point - points[j]) < threshold:
@@ -1132,6 +1147,46 @@ def _seed_shifts(seed: int, dim: int) -> np.ndarray:
     return rng.random(dim)
 
 
+def _gpu_interior_sample(geometry, xb, nrmls, level_set, radius, *, seed, do_outer_refinement, outer_fraction_of_h,
+                         zone, clearance_mode, surface_guard_fraction):
+    """Interior Poisson-disk nodes on the device (dart throwing as greedy independent sets).
+
+    Radius: ``outer_fraction_of_h*radius`` within ``zone`` of a boundary node
+    (if refinement is on), else ``radius``. Acceptance: ``phi >= guard``.
+    In 'seeds' mode boundary and ghost nodes are fixed seeds with clearance
+    ``outer_fraction_of_h*radius``; the level set only guards the surface.
+    """
+    from kernelpack.accelerators.jax_spatial import nearest_within, poisson_disk_sample
+    x_min, x_max = bounding_box_extents(geometry, True)
+    xb_np = np.asarray(xb, dtype=float)
+    nb_np = np.asarray(nrmls, dtype=float)
+    fine = float(outer_fraction_of_h * radius) if do_outer_refinement else float(radius)
+    clearance = fine
+
+    def radius_of(points):
+        if not do_outer_refinement or zone <= 0 or fine >= radius:
+            return np.full(len(points), float(radius))
+        d, _ = nearest_within(points, xb_np, float(zone))
+        return np.where(np.isfinite(d), fine, float(radius))
+
+    if clearance_mode == "seeds":
+        fixed = np.vstack([xb_np, xb_np + GHOST_OFFSET_FRACTION * float(radius) * nb_np])
+        guard = float(surface_guard_fraction) * float(radius)
+    else:
+        fixed = None
+        guard = clearance
+
+    def accept(points):
+        phi = np.asarray(level_set.evaluate(jnp.asarray(points)))
+        return np.isfinite(phi) & (phi >= guard)
+
+    x = poisson_disk_sample(np.asarray(x_min, float), np.asarray(x_max, float), radius_of, fine, seed=seed,
+                            accept=accept, fixed_points=fixed, fixed_radii=clearance)
+    info = {"dimension": int(xb_np.shape[1]), "mode": "gpu_greedy_independent_set", "radius": float(radius),
+            "min_radius": fine, "seed": int(seed), "num_points": int(len(x)), "backend": "jax"}
+    return jnp.asarray(x), info
+
+
 def clip_points_by_geometry(
     x: jnp.ndarray,
     geometry: object,
@@ -1142,10 +1197,21 @@ def clip_points_by_geometry(
     min_signed_distance: float = -jnp.inf,
     max_signed_distance: float = jnp.inf,
     auto_build_level_set: bool = True,
+    fixed_points: jnp.ndarray | None = None,
+    fixed_point_clearance: float = 0.0,
     use_parallel: bool = True,
     chunk_size: int = 5000,
     min_parallel_points: int = 20000,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Keep points by level-set value, optionally also by distance to fixed nodes.
+
+    ``boundary_clearance`` thresholds ``phi`` itself. A CFPU level set is not a
+    distance function: near convex edges and corners ``phi`` is much smaller
+    than the distance to the boundary, so ``phi >= c`` removes points well
+    inside the domain there. ``fixed_points`` (e.g. boundary and ghost nodes)
+    with ``fixed_point_clearance`` instead enforce the clearance as a true
+    distance to nodes that are already placed.
+    """
     del use_parallel, chunk_size, min_parallel_points
     x = jnp.asarray(x, dtype=float)
     level_set = _ensure_geometry_level_set(geometry, auto_build_level_set)
@@ -1161,6 +1227,13 @@ def clip_points_by_geometry(
         float(min_signed_distance),
         float(max_signed_distance),
     )
+    if fixed_points is not None and fixed_point_clearance > 0.0:
+        from scipy.spatial import cKDTree
+
+        fixed = np.asarray(fixed_points, dtype=float)
+        if fixed.size:
+            distance = cKDTree(fixed).query(np.asarray(x, dtype=float))[0]
+            keep_mask = keep_mask & jnp.asarray(distance >= float(fixed_point_clearance))
     return x[keep_mask], keep_mask, phi
 
 
@@ -1242,8 +1315,25 @@ class DomainNodeGenerator:
         do_outer_refinement: bool = False,
         outer_fraction_of_h: float = 1.0,
         outer_refinement_zone_size_as_multiple_of_h: float = 2.0,
+        clearance_mode: str = "level_set",
+        surface_guard_fraction: float = 0.2,
+        sampler: str = "bridson",
         **kwargs: object,
     ) -> None:
+        """Sample interior nodes and clip them to the geometry.
+
+        ``clearance_mode="level_set"`` keeps nodes with ``phi >= clearance``.
+        ``clearance_mode="seeds"`` treats the boundary nodes and their ghosts as
+        fixed Poisson-disk seeds: a node is kept if its distance to every
+        boundary/ghost node is at least ``clearance`` and
+        ``phi >= surface_guard_fraction * radius``. The level set then only
+        rejects points on or outside the surface; it is not used as a distance,
+        which it is not near edges and corners.
+        """
+        if clearance_mode not in {"level_set", "seeds"}:
+            raise ValueError("clearance_mode must be 'level_set' or 'seeds'")
+        if sampler not in {"bridson", "gpu"}:
+            raise ValueError("sampler must be 'bridson' or 'gpu'")
         xb, nrmls, level_set = _build_boundary_state(geometry)
         sampler_kwargs = dict(kwargs)
         mapped_cloud_preferred = bool(sampler_kwargs.pop("mapped_cloud_preferred", False))
@@ -1252,7 +1342,16 @@ class DomainNodeGenerator:
             and mapped_cloud_preferred
             and _supports_mapped_closed_curve_generator(geometry)
         )
-        if use_mapped_closed_curve:
+        if sampler == "gpu":
+            if radius_function is not None or use_mapped_closed_curve:
+                raise ValueError("sampler='gpu' supports the fixed-radius (optionally boundary-refined) mode")
+            x_raw, info = _gpu_interior_sample(
+                geometry, xb, nrmls, level_set, radius,
+                seed=int(sampler_kwargs.get("seed", 0) or 0),
+                do_outer_refinement=do_outer_refinement, outer_fraction_of_h=outer_fraction_of_h,
+                zone=outer_refinement_zone_size_as_multiple_of_h * radius,
+                clearance_mode=clearance_mode, surface_guard_fraction=surface_guard_fraction)
+        elif use_mapped_closed_curve:
             seed = int(sampler_kwargs.pop("seed", 0) or 0)
             x_raw, info = _generate_mapped_closed_curve_nodes(
                 geometry,
@@ -1287,7 +1386,13 @@ class DomainNodeGenerator:
         self.last_info = info
 
         clearance = outer_fraction_of_h * radius if do_outer_refinement else radius
-        self.clip_to_geometry(geometry, keep="inside", boundary_clearance=clearance)
+        if clearance_mode == "seeds":
+            seeds = jnp.vstack([xb, xb + GHOST_OFFSET_FRACTION * radius * nrmls])
+            self.clip_to_geometry(geometry, keep="inside", boundary_clearance=surface_guard_fraction * radius,
+                                  fixed_points=seeds, fixed_point_clearance=clearance)
+        else:
+            self.clip_to_geometry(geometry, keep="inside", boundary_clearance=clearance)
+        self.last_info["clearance_mode"] = clearance_mode
         self.last_info["min_active_radius"] = clearance
         self.last_info["outer_refinement"] = {
             "enabled": bool(do_outer_refinement),
@@ -1312,7 +1417,7 @@ class DomainNodeGenerator:
     def build_domain_descriptor_from_geometry(self, geometry: object, radius: float, **kwargs: object) -> DomainDescriptor:
         self.generate_interior_nodes_from_geometry(geometry, radius, **kwargs)
         xb, nrmls, level_set = _build_boundary_state(geometry)
-        xg = xb + 0.5 * radius * nrmls
+        xg = xb + GHOST_OFFSET_FRACTION * radius * nrmls
         descriptor = DomainDescriptor()
         descriptor.set_nodes(self.xi, xb, xg)
         descriptor.set_normals(nrmls)
@@ -1415,10 +1520,12 @@ class DomainNodeGenerator:
         bdry_mode: int = 0,
         **kwargs: object,
     ) -> DomainDescriptor:
-        radii_arr = _validate_anisotropic_radii(radii, jnp.asarray(bdry_segments[0]).shape[1])
+        from kernelpack.geometry.parametric_pu import ParametricSurfaceData
+        raw=[item.positions if isinstance(item,ParametricSurfaceData) else item for item in bdry_segments]
+        radii_arr = _validate_anisotropic_radii(radii, jnp.asarray(raw[0]).shape[1])
         fit_radius: float | jnp.ndarray = radii_arr if radii_arr is not None else radius
         effective_radius = float(jnp.min(radii_arr)) if radii_arr is not None else float(radius)
-        _validate_piecewise_fit_bounds_from_segments(bdry_segments, None)
+        _validate_piecewise_fit_bounds_from_segments(raw, None)
         piecewise_boundary = PiecewiseSmoothEmbeddedSurface()
         piecewise_boundary.generate_piecewise_smooth_surface_by_segment(
             bdry_segments,
@@ -1430,7 +1537,7 @@ class DomainNodeGenerator:
             smooth_normals=smooth_normals,
             smooth_neighborhood=smooth_neighborhood,
         )
-        _validate_piecewise_fit_bounds_from_segments(bdry_segments, piecewise_boundary)
+        _validate_piecewise_fit_bounds_from_segments(raw, piecewise_boundary)
         piecewise_boundary.build_level_set()
         if radii_arr is not None:
             descriptor = self._build_anisotropic_domain_descriptor_from_geometry(piecewise_boundary, radii_arr, effective_radius, **kwargs)
@@ -1470,21 +1577,106 @@ class DomainNodeGenerator:
         if len(bdry_desc) == 0:
             raise ValueError("bdry_desc must contain at least one segment")
         radii_arr = _validate_anisotropic_radii(radii, 3)
-        fit_radius: float | jnp.ndarray = radii_arr if radii_arr is not None else radius
         effective_radius = float(jnp.min(radii_arr)) if radii_arr is not None else float(radius)
+        piecewise_boundary = self.build_piecewise_smooth_boundary_hierarchical(
+            bdry_desc, is_bdry_curve, is_smooth_curve, constants, constant_dim,
+            flip_normal, radius, method=method, supersample_fac=supersample_fac,
+            radii=radii, bdry_mode=bdry_mode, smooth_normals=smooth_normals,
+            smooth_neighborhood=smooth_neighborhood,
+            seed=int(kwargs.get("seed", 0) or 0), backend=str(kwargs.get("backend", "auto")),
+            feature_sites=kwargs.pop("feature_sites", None),
+            feature_normals=kwargs.pop("feature_normals", None),
+            feature_priorities=kwargs.pop("feature_priorities", None),
+        )
+        omit = list(is_bdry_curve)
+        hierarchical_face_sample_counts = self.last_info["hierarchical_face_sample_counts"]
+        pu_info=self.last_info["parametric_pu_faces"]
+        piecewise_boundary.build_level_set()
+        if radii_arr is not None:
+            descriptor = self._build_anisotropic_domain_descriptor_from_geometry(piecewise_boundary, radii_arr, effective_radius, **kwargs)
+            self.last_info["piecewise_mode"] = "hierarchical"
+            self.last_info["segment_count"] = len(bdry_desc)
+            self.last_info["hierarchical_omitted_segments"] = sum(1 for item in omit if item)
+            self.last_info["hierarchical_face_sample_counts"] = hierarchical_face_sample_counts
+            self.last_info["piecewise_radius_function"] = False
+            self.last_info["anisotropic_radii"] = radii_arr
+            self.last_info["bdry_mode"] = int(bdry_mode)
+            self.last_info["parametric_pu_faces"]=pu_info
+            return descriptor
+        if radius_function is not None:
+            kwargs["radius_function"] = radius_function
+        descriptor = self.build_domain_descriptor_from_geometry(piecewise_boundary, effective_radius, **kwargs)
+        self.last_info["piecewise_mode"] = "hierarchical"
+        self.last_info["segment_count"] = len(bdry_desc)
+        self.last_info["hierarchical_omitted_segments"] = sum(1 for item in omit if item)
+        self.last_info["hierarchical_face_sample_counts"] = hierarchical_face_sample_counts
+        self.last_info["piecewise_radius_function"] = radius_function is not None
+        self.last_info["parametric_pu_faces"]=pu_info
+        return descriptor
+
+    def build_piecewise_smooth_boundary_hierarchical(
+        self, bdry_desc, is_bdry_curve, is_smooth_curve, constants,
+        constant_dim, flip_normal, radius, *, method=1, supersample_fac=2,
+        smooth_normals=False, smooth_neighborhood=0, radii=None, bdry_mode=0,
+        seed=0, backend="auto", feature_sites=None, feature_normals=None,
+        feature_priorities=None,
+    ) -> PiecewiseSmoothEmbeddedSurface:
+        """Build 3D faces from ordered planar outlines and curved data patches.
+
+        Nonsmooth outlines are closed polylines; smooth ones use the periodic
+        curve model. Explicit features carry outward incident-normal directions
+        and priorities (vertices 2, edges 1), independent of face sampling order.
+        This boundary-only entry point does not fit the global implicit or sample
+        the volume. It shares the implementation with the domain entry point.
+        """
+        if not bdry_desc or radius <= 0 or supersample_fac < 1:
+            raise ValueError("nonempty geometry, positive radius and supersampling are required")
+        if any(len(v) != len(bdry_desc) for v in
+               (is_bdry_curve, is_smooth_curve, constants, constant_dim, flip_normal)):
+            raise ValueError("hierarchical descriptor arrays must have matching lengths")
+        radii_arr = _validate_anisotropic_radii(radii, 3)
+        fit_radius = radii_arr if radii_arr is not None else radius
+        effective_radius = float(jnp.min(radii_arr)) if radii_arr is not None else float(radius)
+        from kernelpack.geometry.parametric_pu import ParametricSurfaceData
+        from kernelpack.geometry.spherical_pu import ClosedSurfaceData
+        descriptions=list(bdry_desc)
+        bdry_desc=[item.positions if isinstance(item,(ParametricSurfaceData,ClosedSurfaceData)) else item for item in descriptions]
         raw_size = _hierarchical_raw_boundary_size(bdry_desc, is_bdry_curve, constants, constant_dim)
-        dim = int(jnp.asarray(bdry_desc[0]).shape[1])
-        if dim != 2:
-            # The C++ hierarchical entry point is specifically the 3D route:
-            # 2D boundary curves may first be expanded into 3D surface patches.
-            dim = 3
         segments: list[EmbeddedSurface] = []
         omit: list[bool] = []
         hierarchical_face_sample_counts: list[int] = []
+        pu_info=[]
         for idx, pts_in in enumerate(bdry_desc):
             pts = jnp.asarray(pts_in, dtype=float)
-            if bool(is_bdry_curve[idx]) and bool(is_smooth_curve[idx]):
-                base_nodes = self._generate_hierarchical_face_nodes(pts, radius, seed=int(kwargs.get("seed", 0) or 0) + idx)
+            if isinstance(descriptions[idx],ClosedSurfaceData):
+                # A smooth closed surface (e.g. an obstacle): one piece over the sphere, no trimming loops.
+                if is_bdry_curve[idx]: raise ValueError("closed surface descriptions are physical surfaces")
+                face=EmbeddedSurface()
+                face.build_spherical_pu_model(descriptions[idx],radius=effective_radius,seed=seed+idx,
+                    supersample_fac=supersample_fac)
+                if flip_normal[idx]: face.flip_normals()
+                segments.append(face); omit.append(True)
+                pu_info.append(dict(input_piece=idx,parameterization="sphere",**face.geom_model["model"].diagnostics))
+            elif isinstance(descriptions[idx],ParametricSurfaceData):
+                if is_bdry_curve[idx]: raise ValueError("PU surface descriptions are physical faces")
+                description=descriptions[idx]
+                face=EmbeddedSurface(); face.set_data_sites(pts)
+                face.build_parametric_pu_model(description.parameters,outlines=description.outlines,
+                    radius=effective_radius,validation_parameters=description.validation_parameters,
+                    validation_positions=description.validation_positions,
+                    validation_normals=description.validation_normals,options=description.options,
+                    seed=seed+idx,backend=backend,supersample_fac=supersample_fac)
+                if flip_normal[idx]: face.flip_normals()
+                segments.append(face); omit.append(True)
+                face.geom_model["model"].diagnostics["parameterization"]=(
+                    description.parameterization.method if description.parameterization is not None else "supplied")
+                pu_info.append(dict(input_piece=idx,**face.geom_model["model"].diagnostics))
+            elif bool(is_bdry_curve[idx]):
+                base_nodes = self._generate_hierarchical_face_nodes(
+                    pts, effective_radius, seed=seed + idx,
+                    smooth=bool(is_smooth_curve[idx]), supersample_fac=supersample_fac,
+                    backend=backend,
+                )
                 lifted = _lift_constant_dimension(base_nodes, int(constant_dim[idx]), float(constants[idx]))
                 face = EmbeddedSurface()
                 face.set_data_sites(lifted)
@@ -1494,11 +1686,24 @@ class DomainNodeGenerator:
                 face_area_box = float(curve_box[0] * curve_box[1])
                 num_samples = max(1, int(face_area_box / max(effective_radius * effective_radius, float(jnp.finfo(float).eps))))
                 hierarchical_face_sample_counts.append(num_samples)
-                face_build_radius: float | jnp.ndarray = fit_radius if int(bdry_mode) != 0 and radii_arr is not None else effective_radius
-                face.build_geometric_model_ps(3, face_build_radius, lifted.shape[0], num_samples, method, supersample_fac)
-                if bool(flip_normal[idx]):
-                    face.flip_normals()
-                _orient_constant_face_normals(face, int(constant_dim[idx]), -1.0 if bool(flip_normal[idx]) else 1.0)
+                # The clipped fill already describes this face. Re-fitting it
+                # as an open patch would fill its convex hull across concavities.
+                axis = jnp.zeros((1, 3)).at[0, int(constant_dim[idx])].set(
+                    -1.0 if bool(flip_normal[idx]) else 1.0)
+                face.nrmls = jnp.broadcast_to(axis, lifted.shape)
+                face.uniform_sample_sites = lifted
+                face.uniform_nrmls = face.nrmls
+                face.n = len(lifted)
+                free=[axis for axis in range(3) if axis!=int(constant_dim[idx])]
+                origin=np.zeros(3); origin[int(constant_dim[idx])]=float(constants[idx])
+                from kernelpack.geometry.parametric_pu import rectangular_cover,PUOptions
+                cover_options=PUOptions()
+                cover=rectangular_cover(np.asarray(pts).min(axis=0),np.asarray(pts).max(axis=0),cover_options.initial_grid)
+                face.geom_model=dict(type='affine-face',origin=origin,
+                    basis=np.eye(3)[:,free],outlines=[np.asarray(pts)],normal=np.asarray(axis[0]),
+                    cover_cells=cover,
+                    cover_centers=np.array([(a+b)/2 for a,b in cover]),
+                    cover_widths=np.array([(b-a)*cover_options.overlap/2 for a,b in cover]))
                 segments.append(face)
                 omit.append(True)
             else:
@@ -1507,6 +1712,13 @@ class DomainNodeGenerator:
 
         piecewise_boundary = PiecewiseSmoothEmbeddedSurface()
         piecewise_boundary.set_segments(segments)
+        piecewise_boundary.seed = int(seed)
+        if feature_sites is not None:
+            if feature_normals is None or feature_priorities is None:
+                raise ValueError("feature normals and priorities are required with feature sites")
+            piecewise_boundary.feature_sites = jnp.asarray(feature_sites)
+            piecewise_boundary.feature_normals = jnp.asarray(feature_normals)
+            piecewise_boundary.feature_priorities = jnp.asarray(feature_priorities)
         piecewise_boundary.generate_piecewise_smooth_surface_by_segment_with_omission(
             bdry_desc,
             omit,
@@ -1518,46 +1730,63 @@ class DomainNodeGenerator:
             smooth_normals=smooth_normals,
             smooth_neighborhood=smooth_neighborhood,
         )
+        if feature_sites is None:
+            # Smooth planar face outlines are known feature curves. When their
+            # data sites also belong to another patch, carry the actual incident
+            # normals instead of choosing one face's normal at the join.
+            edge_sites, edge_normals = [], []
+            for i, outline in enumerate(bdry_desc):
+                if not (bool(is_bdry_curve[i]) and bool(is_smooth_curve[i])):
+                    continue
+                points = _lift_constant_dimension(jnp.asarray(outline), int(constant_dim[i]), float(constants[i]))
+                normal = jnp.zeros((1, 3)).at[0, int(constant_dim[i])].set(-1.0 if flip_normal[i] else 1.0)
+                normals = jnp.broadcast_to(normal, points.shape)
+                shared = jnp.zeros(len(points), dtype=bool)
+                for j, other in enumerate(bdry_desc):
+                    if i == j:
+                        continue
+                    sites = (_lift_constant_dimension(jnp.asarray(other), int(constant_dim[j]), float(constants[j]))
+                             if is_bdry_curve[j] else jnp.asarray(other))
+                    incident = jnp.min(distance_matrix(points, sites), axis=1) < 1e-8
+                    if not bool(jnp.any(incident)):
+                        continue
+                    if is_bdry_curve[j]:
+                        other_normals = jnp.broadcast_to(jnp.zeros((1, 3)).at[0, int(constant_dim[j])].set(
+                            -1.0 if flip_normal[j] else 1.0), points.shape)
+                    else:
+                        segment = piecewise_boundary.segments[j]
+                        model = segment.geom_model
+                        if model["type"] in ("parametric-pu","spherical-pu"):
+                            nearest=jnp.argmin(distance_matrix(points,sites),axis=1)
+                            parameters=model["input_parameters"][nearest]
+                            other_normals=segment.evaluate_parametric_frame(parameters)[-1]
+                        else:
+                            uv = (points - jnp.asarray(model["origin"])) @ jnp.asarray(model["basis"])
+                            _, _, other_normals = segment._eval_open_surface_frame(uv)
+                        if flip_normal[j]:
+                            other_normals = -other_normals
+                    normals = normals + jnp.where(incident[:, None], other_normals, 0.)
+                    shared = shared | incident
+                if bool(jnp.any(shared)):
+                    edge_sites.append(points[shared]); edge_normals.append(normals[shared])
+            if edge_sites:
+                piecewise_boundary.feature_sites = jnp.vstack(edge_sites)
+                piecewise_boundary.feature_normals = jnp.vstack(edge_normals)
+                piecewise_boundary.feature_priorities = jnp.ones(len(piecewise_boundary.feature_sites), dtype=int)
+                piecewise_boundary._assemble_boundary(effective_radius, smooth_normals, smooth_neighborhood,
+                    use_uniform=bool(int(bdry_mode) != 0 and radii_arr is not None))
         _validate_assembled_size(raw_size, piecewise_boundary, "hierarchical piecewise-smooth surface")
-        piecewise_boundary.build_level_set()
-        if radii_arr is not None:
-            descriptor = self._build_anisotropic_domain_descriptor_from_geometry(piecewise_boundary, radii_arr, effective_radius, **kwargs)
-            self.last_info["piecewise_mode"] = "hierarchical"
-            self.last_info["segment_count"] = len(bdry_desc)
-            self.last_info["hierarchical_omitted_segments"] = sum(1 for item in omit if item)
-            self.last_info["hierarchical_face_sample_counts"] = hierarchical_face_sample_counts
-            self.last_info["piecewise_radius_function"] = False
-            self.last_info["anisotropic_radii"] = radii_arr
-            self.last_info["bdry_mode"] = int(bdry_mode)
-            return descriptor
-        if radius_function is not None:
-            kwargs["radius_function"] = radius_function
-        descriptor = self.build_domain_descriptor_from_geometry(piecewise_boundary, effective_radius, **kwargs)
-        self.last_info["piecewise_mode"] = "hierarchical"
-        self.last_info["segment_count"] = len(bdry_desc)
-        self.last_info["hierarchical_omitted_segments"] = sum(1 for item in omit if item)
         self.last_info["hierarchical_face_sample_counts"] = hierarchical_face_sample_counts
-        self.last_info["piecewise_radius_function"] = radius_function is not None
-        return descriptor
+        self.last_info["parametric_pu_faces"]=pu_info
+        return piecewise_boundary
 
-    def _generate_hierarchical_face_nodes(self, boundary_curve: jnp.ndarray, radius: float, *, seed: int = 0) -> jnp.ndarray:
-        surface = EmbeddedSurface()
-        surface.set_data_sites(jnp.asarray(boundary_curve, dtype=float))
-        temp_spacing = _closed_curve_length(boundary_curve) / max(int(boundary_curve.shape[0]), 1)
-        surface.build_closed_geometric_model_ps(2, float(temp_spacing), boundary_curve.shape[0])
-        surface.build_level_set_from_geometric_model()
-        generator = DomainNodeGenerator()
-        generator.generate_interior_nodes_from_geometry(
-            surface,
-            float(temp_spacing),
-            seed=seed,
-            strip_count=4,
-            do_outer_refinement=True,
-            outer_fraction_of_h=0.5,
-            outer_refinement_zone_size_as_multiple_of_h=2.0,
-            mapped_cloud_preferred=False,
-        )
-        return jnp.vstack([generator.get_interior_nodes(), surface.get_sample_sites()])
+    def _generate_hierarchical_face_nodes(
+        self, boundary_curve: jnp.ndarray, radius: float, *, seed: int = 0,
+        smooth: bool = True, supersample_fac: int = 2, backend: str = "auto",
+    ) -> jnp.ndarray:
+        from kernelpack.nodes.hierarchical import sample_planar_face
+        return sample_planar_face(boundary_curve, radius, seed=seed, smooth=smooth,
+                                  supersample_fac=supersample_fac, backend=backend)
 
     def get_interior_nodes(self) -> jnp.ndarray:
         return self.xi
@@ -1667,7 +1896,10 @@ def _validate_assembled_size(raw_size: float, piecewise_boundary: PiecewiseSmoot
     box = jnp.asarray(piecewise_boundary.get_uniform_bounding_box(), dtype=float)
     if box.size == 0:
         return
-    ext = box.max(axis=0) - box.min(axis=0)
+    # Compare axis-aligned extents on both sides. Taking axis extents of
+    # an oriented box double-counts its rotation and rejects valid planar faces.
+    points = jnp.asarray(piecewise_boundary.get_uniform_bdry_nodes(), dtype=float)
+    ext = points.max(axis=0) - points.min(axis=0)
     if ext.shape[0] == 2:
         assembled_size = float(2.0 * (ext[0] + ext[1]))
     elif ext.shape[0] == 3:

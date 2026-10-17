@@ -6,6 +6,7 @@ from typing import Callable
 import jax.numpy as jnp
 from jax import core as jax_core, vmap
 import lineax as lx
+from ._cudss import solve_sparse_system_cudss, CudssSparsePattern
 
 from kernelpack.domain import DomainDescriptor
 from kernelpack.rbffd import OpProperties, StencilProperties
@@ -15,9 +16,12 @@ from ._common import (
     build_domain_state,
     build_initial_guess,
     build_fixed_ilu_preconditioner,
+    build_fixed_sparse_lu_preconditioner,
     build_stencil_properties,
     build_system_rhs,
     solve_sparse_system_gmres,
+    solve_sparse_system_scipy_gmres,
+    solve_sparse_system_scipy_direct,
     sparse_matrix_to_dense,
     SparseCOOMatrix,
     FrozenILUPreconditioner,
@@ -151,11 +155,23 @@ class VariablePoissonSolver:
     cached_dir_coeff_: jnp.ndarray = field(default_factory=lambda: jnp.zeros(0))
     cached_pure_neumann_: bool = False
     last_solve_used_nullspace_: bool = False
+    assemble_dense_operators: bool = True
+    sparse_assembly_chunk_size: int | None = None
 
-    def init(self, domain: DomainDescriptor, xi: int, num_omp_threads: int = 1) -> None:
+    def init(
+        self,
+        domain: DomainDescriptor,
+        xi: int,
+        num_omp_threads: int = 1,
+        *,
+        sparse_assembly_chunk_size: int | None = None,
+        assemble_dense_operators: bool | None = None,
+    ) -> None:
         self.domain = domain
         self.xi = xi
         self.num_omp_threads = num_omp_threads
+        self.sparse_assembly_chunk_size = sparse_assembly_chunk_size
+        self.assemble_dense_operators = (self.linear_solver != "cudss") if assemble_dense_operators is None else bool(assemble_dense_operators)
         state = build_domain_state(self.domain)
         self.x = state.x
         self.xb = state.xb
@@ -166,14 +182,17 @@ class VariablePoissonSolver:
         self.lap_stencil_properties = build_stencil_properties(self.domain, self.xi, 2, "interior_boundary")
         self.bc_stencil_properties = build_stencil_properties(self.domain, self.xi, 1, "boundary")
 
-        self.lap = assemble_operator(
-            self.domain,
-            self.lap_assembler,
-            self.lap_stencil,
-            "lap",
-            self.lap_stencil_properties,
-            self.lap_op_properties,
-        )
+        if self.assemble_dense_operators:
+            self.lap = assemble_operator(
+                self.domain,
+                self.lap_assembler,
+                self.lap_stencil,
+                "lap",
+                self.lap_stencil_properties,
+                self.lap_op_properties,
+            )
+        else:
+            self.lap = jnp.zeros((0, 0), dtype=float)
         self.lap_sparse = assemble_operator_sparse(
             self.domain,
             self.lap_assembler,
@@ -181,22 +200,24 @@ class VariablePoissonSolver:
             "lap",
             self.lap_stencil_properties,
             self.lap_op_properties,
+            chunk_size=self.sparse_assembly_chunk_size,
         )
         grad_ops = []
         grad_sparse_ops = []
         for d in range(self.domain.get_dim()):
             grad_props = OpProperties(decompose=False, store_weights=True, record_stencils=False)
             grad_props.selectdim = d
-            grad_ops.append(
-                assemble_operator(
-                    self.domain,
-                    self.lap_assembler,
-                    self.lap_stencil,
-                    "grad",
-                    self.lap_stencil_properties,
-                    grad_props,
+            if self.assemble_dense_operators:
+                grad_ops.append(
+                    assemble_operator(
+                        self.domain,
+                        self.lap_assembler,
+                        self.lap_stencil,
+                        "grad",
+                        self.lap_stencil_properties,
+                        grad_props,
+                    )
                 )
-            )
             grad_sparse_ops.append(
                 assemble_operator_sparse(
                     self.domain,
@@ -205,9 +226,12 @@ class VariablePoissonSolver:
                     "grad",
                     self.lap_stencil_properties,
                     grad_props,
+                    chunk_size=self.sparse_assembly_chunk_size,
                 )
             )
-        self.grad = tuple(grad_ops)
+        self.grad = tuple(grad_ops) if self.assemble_dense_operators else tuple(
+            jnp.zeros((0, 0), dtype=float) for _ in range(self.domain.get_dim())
+        )
         self.grad_sparse = tuple(grad_sparse_ops)
         self.pde = jnp.zeros((0, self.nf), dtype=float)
         self.pde_sparse = None
@@ -244,18 +268,24 @@ class VariablePoissonSolver:
         )
 
     def _ensure_boundary_operator(self, neu_coeff: jnp.ndarray, dir_coeff: jnp.ndarray) -> None:
-        if self.fixed_bc_operator_ready_ and self.bc.shape[0] > 0:
+        if self.fixed_bc_operator_ready_ and (
+            (self.assemble_dense_operators and self.bc.shape[0] > 0)
+            or (not self.assemble_dense_operators and self.bc_sparse is not None)
+        ):
             return
-        self.bc = assemble_operator(
-            self.domain,
-            self.bc_assembler,
-            self.bc_stencil,
-            "bc",
-            self.bc_stencil_properties,
-            self.bc_op_properties,
-            neu_coeff=neu_coeff,
-            dir_coeff=dir_coeff,
-        )
+        if self.assemble_dense_operators:
+            self.bc = assemble_operator(
+                self.domain,
+                self.bc_assembler,
+                self.bc_stencil,
+                "bc",
+                self.bc_stencil_properties,
+                self.bc_op_properties,
+                neu_coeff=neu_coeff,
+                dir_coeff=dir_coeff,
+            )
+        else:
+            self.bc = jnp.zeros((0, self.nf), dtype=float)
         self.bc_sparse = assemble_operator_sparse(
             self.domain,
             self.bc_assembler,
@@ -265,6 +295,7 @@ class VariablePoissonSolver:
             self.bc_op_properties,
             neu_coeff=neu_coeff,
             dir_coeff=dir_coeff,
+            chunk_size=self.sparse_assembly_chunk_size,
         )
         if self.fixed_bc_coefficients_ready_:
             self.fixed_bc_operator_ready_ = True
@@ -279,6 +310,17 @@ class VariablePoissonSolver:
 
         neu_coeff, dir_coeff = self._get_boundary_coefficients(neu_coeff_func, dir_coeff_func)
         self._ensure_boundary_operator(neu_coeff, dir_coeff)
+        # Pure Neumann rows leave the constants in the null space; the system is then bordered.
+        self.cached_pure_neumann_ = float(jnp.max(jnp.abs(dir_coeff))) <= 1e-13
+        if self.linear_solver == "cudss":
+            pde = _build_variable_pde_operator_sparse(self.lap_sparse, self.grad_sparse, jnp.ones(self.nf), self.n)
+            matrix = _build_variable_system_matrix_sparse(pde, self.bc_sparse, self.nf, self.cached_pure_neumann_)
+            self.cudss_pattern = CudssSparsePattern(matrix)
+
+    def close_cudss(self):
+        pattern=getattr(self,"cudss_pattern",None)
+        if pattern is not None:
+            pattern.close()
 
     def solve(
         self,
@@ -296,9 +338,12 @@ class VariablePoissonSolver:
         if not isinstance(coeff_all, jax_core.Tracer) and bool(jnp.any(coeff_all <= 0)):
             raise ValueError("VariablePoissonSolver expects a positive scalar coefficient field.")
 
-        self.pde = _build_variable_pde_operator(self.lap, self.grad, coeff_all, self.n)
-        if self.lap_sparse is not None:
-            self.pde_sparse = _build_variable_pde_operator_sparse(self.lap_sparse, self.grad_sparse, coeff_all, self.n)
+        self.pde = (
+            _build_variable_pde_operator(self.lap, self.grad, coeff_all, self.n)
+            if self.assemble_dense_operators
+            else jnp.zeros((0, self.nf), dtype=float)
+        )
+        self.pde_sparse = None if self.lap_sparse is None else _build_variable_pde_operator_sparse(self.lap_sparse, self.grad_sparse, coeff_all, self.n)
 
         neu_coeff, dir_coeff = self._get_boundary_coefficients(neu_coeff_func, dir_coeff_func)
         self._ensure_boundary_operator(neu_coeff, dir_coeff)
@@ -310,29 +355,55 @@ class VariablePoissonSolver:
         )
         self.last_solve_used_nullspace_ = pure_neumann
 
-        system = _build_variable_system_matrix(self.pde, self.bc, self.nf, pure_neumann)
+        system = (
+            _build_variable_system_matrix(self.pde, self.bc, self.nf, pure_neumann)
+            if self.assemble_dense_operators
+            else jnp.zeros((0, 0), dtype=float)
+        )
         sparse_system = None if self.pde_sparse is None or self.bc_sparse is None else _build_variable_system_matrix_sparse(self.pde_sparse, self.bc_sparse, self.nf, pure_neumann)
         rhs = build_system_rhs(rhs_target, rhs_boundary, pure_neumann)
         guess = build_initial_guess(initial_guess, self.n, self.nf, rhs_boundary, pure_neumann)
 
-        if self.linear_solver == "dense":
+        if self.linear_solver == "cudss":
+            pattern = getattr(self, "cudss_pattern", None)
+            if pattern is None and not isinstance(sparse_system.indices, jax_core.Tracer):
+                pattern = self.cudss_pattern = CudssSparsePattern(sparse_system)
+            sol = solve_sparse_system_cudss(sparse_system, rhs, pattern)
+        elif self.linear_solver == "dense":
             sol = solve_dense_system(system, rhs) if guess is None else gmres_with_fallback(system, rhs, guess)
             self.fixed_preconditioner = None
         elif self.linear_solver == "lineax":
             dense_system = system if system.size else sparse_matrix_to_dense(sparse_system)
             sol = _solve_lineax_system(dense_system, rhs)
             self.fixed_preconditioner = None
-        elif self.linear_solver == "gmres_ilu":
+        elif self.linear_solver in ("gmres_ilu", "scipy_gmres_ilu", "scipy_sparse_direct"):
             if sparse_system is None:
                 raise ValueError("sparse solve requires sparse operator assembly")
-            if self.fixed_preconditioner is None:
+            if self.linear_solver == "scipy_sparse_direct":
+                sol = solve_sparse_system_scipy_direct(sparse_system, rhs)
+            elif self.fixed_preconditioner is None:
                 if isinstance(sparse_system.values, jax_core.Tracer):
                     raise ValueError(
-                        "VariablePoissonSolver linear_solver='gmres_ilu' requires a frozen preconditioner when solving inside a differentiated trace. "
+                        "VariablePoissonSolver sparse iterative solvers require a frozen preconditioner when solving inside a differentiated trace. "
                         "Call prepare_preconditioner(...) outside the differentiated path first."
                     )
                 self.fixed_preconditioner = build_fixed_ilu_preconditioner(sparse_system)
-            sol = solve_sparse_system_gmres(sparse_system, rhs, guess=guess, preconditioner=self.fixed_preconditioner)
+            if self.linear_solver == "scipy_sparse_direct":
+                pass
+            elif self.linear_solver == "scipy_gmres_ilu":
+                sol = solve_sparse_system_scipy_gmres(
+                    sparse_system,
+                    rhs,
+                    guess=guess,
+                    preconditioner=self.fixed_preconditioner,
+                )
+            else:
+                sol = solve_sparse_system_gmres(
+                    sparse_system,
+                    rhs,
+                    guess=guess,
+                    preconditioner=self.fixed_preconditioner,
+                )
         else:
             raise ValueError(f'unknown linear solver {self.linear_solver}')
 
@@ -355,7 +426,7 @@ class VariablePoissonSolver:
             "BC_sparse": self.bc_sparse,
             "system_matrix": system,
             "system_matrix_sparse": sparse_system,
-            "system_matrix_dense_from_sparse": None if sparse_system is None else sparse_matrix_to_dense(sparse_system),
+            "system_matrix_dense_from_sparse": None,
             "rhs": rhs,
             "target_rhs": rhs_target,
             "boundary_rhs": rhs_boundary,
@@ -387,6 +458,8 @@ class VariablePoissonSolver:
         coeff: Callable[..., jnp.ndarray] | jnp.ndarray,
         neu_coeff_func: Callable[..., jnp.ndarray] | jnp.ndarray,
         dir_coeff_func: Callable[..., jnp.ndarray] | jnp.ndarray,
+        *,
+        exact_sparse_lu: bool = False,
     ) -> FrozenILUPreconditioner:
         coeff_all = evaluate_node_callback(coeff, self.xf, "coefficient")
         coeff_all = _ensure_unbatched_operator_input(coeff_all, "coefficient")
@@ -397,16 +470,19 @@ class VariablePoissonSolver:
         dir_coeff = evaluate_node_callback(dir_coeff_func, self.xb, "boundary coefficient")
         neu_coeff = _ensure_unbatched_operator_input(neu_coeff, "boundary coefficient")
         dir_coeff = _ensure_unbatched_operator_input(dir_coeff, "boundary coefficient")
-        bc_dense = assemble_operator(
-            self.domain,
-            self.bc_assembler,
-            self.bc_stencil,
-            "bc",
-            self.bc_stencil_properties,
-            self.bc_op_properties,
-            neu_coeff=neu_coeff,
-            dir_coeff=dir_coeff,
-        )
+        if self.assemble_dense_operators:
+            bc_dense = assemble_operator(
+                self.domain,
+                self.bc_assembler,
+                self.bc_stencil,
+                "bc",
+                self.bc_stencil_properties,
+                self.bc_op_properties,
+                neu_coeff=neu_coeff,
+                dir_coeff=dir_coeff,
+            )
+        else:
+            bc_dense = jnp.zeros((0, self.nf), dtype=float)
         bc_sparse = assemble_operator_sparse(
             self.domain,
             self.bc_assembler,
@@ -416,6 +492,7 @@ class VariablePoissonSolver:
             self.bc_op_properties,
             neu_coeff=neu_coeff,
             dir_coeff=dir_coeff,
+            chunk_size=self.sparse_assembly_chunk_size,
         )
         # Reuse the same fixed boundary operator during traced solve calls so
         # autodiff never falls back into dynamic operator assembly.
@@ -428,13 +505,20 @@ class VariablePoissonSolver:
         self.fixed_bc_operator_ready_ = True
         pure_neumann = self.cached_pure_neumann_
         sparse_system = _build_variable_system_matrix_sparse(pde_sparse, bc_sparse, self.nf, pure_neumann)
-        self.fixed_preconditioner = build_fixed_ilu_preconditioner(sparse_system)
+        preconditioner_application = "host_callback" if not self.assemble_dense_operators else "dense"
+        if exact_sparse_lu:
+            self.fixed_preconditioner = build_fixed_sparse_lu_preconditioner(sparse_system)
+        else:
+            self.fixed_preconditioner = build_fixed_ilu_preconditioner(
+                sparse_system,
+                application=preconditioner_application,
+            )
         return self.fixed_preconditioner
 
     def freeze(self) -> "StatelessVariablePoissonSolver":
         """Snapshot the prepared solver into a stateless, solve-only wrapper."""
 
-        if self.bc.shape[0] == 0 or self.bc_sparse is None:
+        if self.bc_sparse is None or (self.assemble_dense_operators and self.bc.shape[0] == 0):
             raise ValueError("Call prepare_boundary_operator(...) before freeze()")
         if self.linear_solver == "gmres_ilu" and self.fixed_preconditioner is None:
             raise ValueError("Call prepare_preconditioner(...) before freeze() when using gmres_ilu")
@@ -447,10 +531,9 @@ class VariablePoissonSolver:
 class StatelessVariablePoissonSolver:
     """Frozen variable Poisson solve context with no in-solve mutation.
 
-    All fixed spatial operators and boundary data are captured once up front,
-    so repeated differentiable evaluations only rebuild the
-    coefficient-dependent PDE block and the linear system. This remains an
-    implementation detail rather than part of the public solver namespace.
+    This wrapper is meant for inverse problems. All fixed spatial operators and
+    boundary data are captured once up front, so repeated residual evaluations
+    only rebuild the coefficient-dependent PDE block and the linear system.
     """
 
     domain: DomainDescriptor
@@ -475,12 +558,17 @@ class StatelessVariablePoissonSolver:
     cached_neu_coeff_: jnp.ndarray
     cached_dir_coeff_: jnp.ndarray
     cached_pure_neumann_: bool
+    cudss_pattern: object | None = None
+
+    def close_cudss(self):
+        if self.cudss_pattern is not None:
+            self.cudss_pattern.close()
 
     @classmethod
     def from_solver(cls, solver: VariablePoissonSolver) -> "StatelessVariablePoissonSolver":
         if solver.n <= 0:
             raise ValueError("StatelessVariablePoissonSolver requires an initialized VariablePoissonSolver")
-        if solver.bc.shape[0] == 0 or solver.bc_sparse is None:
+        if solver.bc_sparse is None:
             raise ValueError("Call prepare_boundary_operator(...) on the base solver before freezing it")
         return cls(
             domain=solver.domain,
@@ -505,6 +593,7 @@ class StatelessVariablePoissonSolver:
             cached_neu_coeff_=solver.cached_neu_coeff_,
             cached_dir_coeff_=solver.cached_dir_coeff_,
             cached_pure_neumann_=solver.cached_pure_neumann_,
+            cudss_pattern=getattr(solver, "cudss_pattern", None),
         )
 
     def solve(
@@ -524,27 +613,44 @@ class StatelessVariablePoissonSolver:
         if not isinstance(coeff_all, jax_core.Tracer) and bool(jnp.any(coeff_all <= 0)):
             raise ValueError("VariablePoissonSolver expects a positive scalar coefficient field.")
 
-        pde = _build_variable_pde_operator(self.lap, self.grad, coeff_all, self.n)
+        pde = (_build_variable_pde_operator(self.lap, self.grad, coeff_all, self.n)
+               if self.linear_solver != "cudss" else jnp.zeros((0, self.nf)))
         pde_sparse = None if self.lap_sparse is None else _build_variable_pde_operator_sparse(self.lap_sparse, self.grad_sparse, coeff_all, self.n)
         pure_neumann = self.cached_pure_neumann_
-        system = _build_variable_system_matrix(pde, self.bc, self.nf, pure_neumann)
+        system = (_build_variable_system_matrix(pde, self.bc, self.nf, pure_neumann)
+                  if self.linear_solver != "cudss" else jnp.zeros((0, 0)))
         sparse_system = None if pde_sparse is None or self.bc_sparse is None else _build_variable_system_matrix_sparse(pde_sparse, self.bc_sparse, self.nf, pure_neumann)
         rhs_target = evaluate_node_callback(forcing, self.x, "forcing")
         rhs_boundary = evaluate_boundary_values(bc, self.cached_neu_coeff_, self.cached_dir_coeff_, self.nr, self.xb)
         rhs = build_system_rhs(rhs_target, rhs_boundary, pure_neumann)
         guess = build_initial_guess(initial_guess, self.n, self.nf, rhs_boundary, pure_neumann)
 
-        if self.linear_solver == "dense":
+        if self.linear_solver == "cudss":
+            sol = solve_sparse_system_cudss(sparse_system, rhs, self.cudss_pattern)
+        elif self.linear_solver == "dense":
             sol = solve_dense_system(system, rhs) if guess is None else gmres_with_fallback(system, rhs, guess)
         elif self.linear_solver == "lineax":
             dense_system = system if system.size else sparse_matrix_to_dense(sparse_system)
             sol = _solve_lineax_system(dense_system, rhs)
-        elif self.linear_solver == "gmres_ilu":
+        elif self.linear_solver in ("gmres_ilu", "scipy_gmres_ilu"):
             if sparse_system is None:
                 raise ValueError("sparse solve requires sparse operator assembly")
             if self.fixed_preconditioner is None:
                 raise ValueError("StatelessVariablePoissonSolver requires a frozen preconditioner for gmres_ilu")
-            sol = solve_sparse_system_gmres(sparse_system, rhs, guess=guess, preconditioner=self.fixed_preconditioner)
+            if self.linear_solver == "scipy_gmres_ilu":
+                sol = solve_sparse_system_scipy_gmres(
+                    sparse_system,
+                    rhs,
+                    guess=guess,
+                    preconditioner=self.fixed_preconditioner,
+                )
+            else:
+                sol = solve_sparse_system_gmres(
+                    sparse_system,
+                    rhs,
+                    guess=guess,
+                    preconditioner=self.fixed_preconditioner,
+                )
         else:
             raise ValueError(f"unknown linear solver {self.linear_solver}")
 
@@ -599,7 +705,11 @@ class StatelessVariablePoissonSolver:
         system = None
         sparse_system = None
 
-        if self.linear_solver == "dense":
+        if self.linear_solver == "cudss":
+            pde_sparse = _build_variable_pde_operator_sparse(self.lap_sparse, self.grad_sparse, coeff_all, self.n)
+            sparse_system = _build_variable_system_matrix_sparse(pde_sparse, self.bc_sparse, self.nf, pure_neumann)
+            sol = solve_sparse_system_cudss(sparse_system, rhs, self.cudss_pattern)
+        elif self.linear_solver == "dense":
             pde = _build_variable_pde_operator(self.lap, self.grad, coeff_all, self.n)
             system = _build_variable_system_matrix(pde, self.bc, self.nf, pure_neumann)
             sol = solve_dense_system(system, rhs) if guess is None else gmres_with_fallback(system, rhs, guess)
@@ -607,7 +717,7 @@ class StatelessVariablePoissonSolver:
             pde = _build_variable_pde_operator(self.lap, self.grad, coeff_all, self.n)
             system = _build_variable_system_matrix(pde, self.bc, self.nf, pure_neumann)
             sol = _solve_lineax_system(system, rhs)
-        elif self.linear_solver == "gmres_ilu":
+        elif self.linear_solver in ("gmres_ilu", "scipy_gmres_ilu"):
             if self.lap_sparse is None or self.bc_sparse is None:
                 raise ValueError("sparse solve requires sparse operator assembly")
             pde_sparse = _build_variable_pde_operator_sparse(self.lap_sparse, self.grad_sparse, coeff_all, self.n)
@@ -616,7 +726,20 @@ class StatelessVariablePoissonSolver:
                 raise ValueError("sparse solve requires sparse operator assembly")
             if self.fixed_preconditioner is None:
                 raise ValueError("StatelessVariablePoissonSolver requires a frozen preconditioner for gmres_ilu")
-            sol = solve_sparse_system_gmres(sparse_system, rhs, guess=guess, preconditioner=self.fixed_preconditioner)
+            if self.linear_solver == "scipy_gmres_ilu":
+                sol = solve_sparse_system_scipy_gmres(
+                    sparse_system,
+                    rhs,
+                    guess=guess,
+                    preconditioner=self.fixed_preconditioner,
+                )
+            else:
+                sol = solve_sparse_system_gmres(
+                    sparse_system,
+                    rhs,
+                    guess=guess,
+                    preconditioner=self.fixed_preconditioner,
+                )
         else:
             raise ValueError(f"unknown linear solver {self.linear_solver}")
 
@@ -667,7 +790,11 @@ class StatelessVariablePoissonSolver:
         rhs = build_system_rhs(rhs_target, rhs_boundary, pure_neumann)
         guess = build_initial_guess(initial_guess, self.n, self.nf, rhs_boundary, pure_neumann)
 
-        if self.linear_solver == "dense":
+        if self.linear_solver == "cudss":
+            pde_sparse = _build_variable_pde_operator_sparse(self.lap_sparse, self.grad_sparse, coeff_all, self.n)
+            sparse_system = _build_variable_system_matrix_sparse(pde_sparse, self.bc_sparse, self.nf, pure_neumann)
+            sol = solve_sparse_system_cudss(sparse_system, rhs, self.cudss_pattern)
+        elif self.linear_solver == "dense":
             pde = _build_variable_pde_operator(self.lap, self.grad, coeff_all, self.n)
             system = _build_variable_system_matrix(pde, self.bc, self.nf, pure_neumann)
             sol = solve_dense_system(system, rhs) if guess is None else gmres_with_fallback(system, rhs, guess)
@@ -675,14 +802,27 @@ class StatelessVariablePoissonSolver:
             pde = _build_variable_pde_operator(self.lap, self.grad, coeff_all, self.n)
             system = _build_variable_system_matrix(pde, self.bc, self.nf, pure_neumann)
             sol = _solve_lineax_system(system, rhs)
-        elif self.linear_solver == "gmres_ilu":
+        elif self.linear_solver in ("gmres_ilu", "scipy_gmres_ilu"):
             if self.lap_sparse is None or self.bc_sparse is None:
                 raise ValueError("sparse solve requires sparse operator assembly")
             if self.fixed_preconditioner is None:
                 raise ValueError("StatelessVariablePoissonSolver requires a frozen preconditioner for gmres_ilu")
             pde_sparse = _build_variable_pde_operator_sparse(self.lap_sparse, self.grad_sparse, coeff_all, self.n)
             sparse_system = _build_variable_system_matrix_sparse(pde_sparse, self.bc_sparse, self.nf, pure_neumann)
-            sol = solve_sparse_system_gmres(sparse_system, rhs, guess=guess, preconditioner=self.fixed_preconditioner)
+            if self.linear_solver == "scipy_gmres_ilu":
+                sol = solve_sparse_system_scipy_gmres(
+                    sparse_system,
+                    rhs,
+                    guess=guess,
+                    preconditioner=self.fixed_preconditioner,
+                )
+            else:
+                sol = solve_sparse_system_gmres(
+                    sparse_system,
+                    rhs,
+                    guess=guess,
+                    preconditioner=self.fixed_preconditioner,
+                )
         else:
             raise ValueError(f"unknown linear solver {self.linear_solver}")
 

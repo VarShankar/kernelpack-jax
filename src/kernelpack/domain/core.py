@@ -5,27 +5,18 @@ from functools import partial
 import os
 import numpy as np
 
+import jax
 from jax import jit, lax
 import jax.numpy as jnp
 
 from kernelpack.accelerators import WarpUnavailableError, warp_available, warp_exact_ball, warp_exact_knn
 from kernelpack.geometry import distance_matrix
+from .stencils import exact_knn as _jax_exact_knn, select_stencils, nearest_periodic_images
 
-
-@partial(jit, static_argnames=("k",))
-def _jax_exact_knn(
-    query_points: jnp.ndarray,
-    points: jnp.ndarray,
-    point_active: jnp.ndarray,
-    *,
-    k: int,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
-    query_sq = jnp.sum(query_points * query_points, axis=1, keepdims=True)
-    point_sq = jnp.sum(points * points, axis=1)[None, :]
-    squared_distances = jnp.maximum(query_sq + point_sq - 2.0 * (query_points @ points.T), 0.0)
-    squared_distances = jnp.where(point_active[None, :], squared_distances, jnp.inf)
-    negative_distances, indices = lax.top_k(-squared_distances, k)
-    return indices, jnp.sqrt(jnp.maximum(-negative_distances, 0.0))
+# Exact kNN: dense GPU top-k in row blocks up to this many query-point pairs (measured faster than the
+# cell-blocked search for n_s up to 4*241 on 3e4 nodes), cell-blocked search beyond.
+_DENSE_KNN_MAX_PAIRS = 10 ** 10
+_DENSE_KNN_BLOCK_ENTRIES = 1 << 27     # distances per dense block (1 GiB in float64)
 
 
 @dataclass
@@ -52,6 +43,50 @@ class DomainDescriptor:
     interior_active: jnp.ndarray = field(default_factory=lambda: jnp.zeros((0,), dtype=bool))
     boundary_active: jnp.ndarray = field(default_factory=lambda: jnp.zeros((0,), dtype=bool))
     ghost_active: jnp.ndarray = field(default_factory=lambda: jnp.zeros((0,), dtype=bool))
+    # Boundary-aware stencils (see kernelpack.domain.boundary_aware); None = Euclidean nearest neighbours.
+    stencil_level_set: object | None = None
+    stencil_stats: dict = field(default_factory=dict)
+    periodic_bounds: jnp.ndarray | None = None
+    periodic_dims: jnp.ndarray | None = None
+
+    def set_periodic(self,bounds=None,periodic_dims=None):
+        """Enable rectangular periodic stencil geometry; None disables it.
+
+        This configures selection/local coordinates, not PDE boundary rows.
+        Boundary-aware ray filtering cannot currently be combined with it.
+        """
+        if bounds is None:
+            self.periodic_bounds=None
+            self.periodic_dims=None
+            return
+        if self.stencil_level_set is not None:
+            raise ValueError("Periodic and level-set-filtered stencils cannot be combined")
+        bounds=jnp.asarray(bounds,dtype=self.x.dtype)
+        dim=self.x.shape[1]
+        mask=jnp.ones(dim,dtype=bool) if periodic_dims is None else jnp.asarray(periodic_dims,dtype=bool)
+        if bounds.shape!=(2,dim) or mask.shape!=(dim,):
+            raise ValueError("Periodic bounds/mask must match spatial dimension")
+        lengths=bounds[1]-bounds[0]
+        if not bool(jnp.all(jnp.isfinite(bounds))&jnp.all(jnp.where(mask,lengths>0,lengths>=0))):
+            raise ValueError("Periodic dimensions require finite bounds of positive length")
+        self.periodic_bounds=bounds
+        self.periodic_dims=mask
+
+    def stencil_coordinates(self,tree_mode,queries,indices):
+        """Coordinates for local fits; indices continue to address physical DOFs."""
+        nodes=self.get_tree_points(tree_mode)[indices]
+        if self.periodic_bounds is None:
+            return nodes
+        return nearest_periodic_images(nodes,queries,
+            self.periodic_bounds[1]-self.periodic_bounds[0],self.periodic_dims)
+
+    def _query_distances(self,points,queries):
+        if self.periodic_bounds is None:
+            return distance_matrix(queries,points)
+        import jax
+        images=jax.vmap(lambda q:nearest_periodic_images(points,q,
+            self.periodic_bounds[1]-self.periodic_bounds[0],self.periodic_dims))(queries)
+        return jnp.linalg.norm(images-queries[:,None,:],axis=-1)
 
     def set_nodes(self, int_nodes: jnp.ndarray, bdry_nodes: jnp.ndarray, ghost_nodes: jnp.ndarray | None = None) -> None:
         int_nodes = jnp.asarray(int_nodes, dtype=float)
@@ -116,6 +151,51 @@ class DomainDescriptor:
             raise ValueError("boundary normals must match boundary node count")
         self.nrmls = nrmls
 
+    def set_stencil_level_set(self, model: object, h: float | None = None, **options) -> None:
+        """Select stencils by ray tracing against the implicit layer `model` (a CFPU model); None disables."""
+        if model is None:
+            self.stencil_level_set = None
+            return
+        if self.periodic_bounds is not None:
+            raise ValueError("Periodic and level-set-filtered stencils cannot be combined")
+        from kernelpack.domain.boundary_aware import StencilLevelSet
+        self.stencil_level_set = StencilLevelSet(model, self.sep_rad if h is None else h, **options)
+        self._stencil_phi_nodes = {}
+        self._stencil_memo = {}
+
+    def _boundary_aware_knn(self, tree_mode: str, query_points, k: int, backend: str):
+        from kernelpack.domain.boundary_aware import boundary_aware_knn
+        tree_mode = _normalize_tree_mode(tree_mode)
+        _, points = self._get_tree_data(tree_mode)
+        n_tree = int(points.shape[0])
+        K = min(4 * int(k), n_tree)
+        idx, dist = self.query_knn(tree_mode, query_points, K, backend=backend, _euclidean=True)
+        idx, dist = np.asarray(idx), np.asarray(dist)
+        q = np.atleast_2d(np.asarray(query_points, dtype=float))
+        if not (np.linalg.norm(np.asarray(points)[idx[:, 0]] - q, axis=1) <= 1e-12 * (1 + np.abs(q).max())).all():
+            return jnp.asarray(idx[:, :k]), jnp.asarray(dist[:, :k])   # centers that are not tree points: Euclidean
+        owner = np.arange(n_tree)
+        if tree_mode == "all":
+            ni, nb, ng = self.get_num_interior_nodes(), self.get_num_bdry_nodes(), int(self.xg.shape[0])
+            if ng == nb:
+                owner[ni + nb:] = ni + np.arange(ng)   # ghost i belongs to boundary node i
+        key = (tree_mode, int(k), q.shape, hash(q.tobytes()))
+        memo = getattr(self, "_stencil_memo", {})
+        if key in memo:
+            return memo[key]
+        cache = getattr(self, "_stencil_phi_nodes", {})
+        if tree_mode not in cache:
+            cache[tree_mode] = self.stencil_level_set(np.asarray(points))
+            self._stencil_phi_nodes = cache
+        stats = {}
+        out_i, out_d = boundary_aware_knn(np.asarray(points), owner, cache[tree_mode], idx, dist, int(k),
+                                          self.stencil_level_set, stats=stats)
+        self.stencil_stats = {key: self.stencil_stats.get(key, 0) + val for key, val in stats.items()} | {
+            "queries": self.stencil_stats.get("queries", 0) + 1}
+        memo[key] = (jnp.asarray(out_i, dtype=int), jnp.asarray(out_d, dtype=float))
+        self._stencil_memo = memo
+        return memo[key]
+
     def set_outer_level_set(self, level_set: object) -> None:
         self.outer_level_set = level_set
 
@@ -137,7 +217,25 @@ class DomainDescriptor:
         k: int,
         *,
         backend: str = "auto",
+        _euclidean: bool = False,
+        center_indices: jnp.ndarray | None = None,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        if self.periodic_bounds is not None:
+            if backend not in {"auto","jax","warp","cpu"}:
+                raise ValueError("Unknown neighbor backend")
+            _,points=self._get_tree_data(tree_mode)
+            queries=jnp.atleast_2d(jnp.asarray(query_points,dtype=points.dtype))
+            if points.size==0:
+                return jnp.zeros((len(queries),0),dtype=int),jnp.zeros((len(queries),0),dtype=points.dtype)
+            ids,images,valid=select_stencils(points,queries,k=min(int(k),len(points)),
+                lengths=self.periodic_bounds[1]-self.periodic_bounds[0],periodic=self.periodic_dims,
+                point_active=self.get_tree_active_mask(tree_mode),
+                center_indices=center_indices,use_periodic=True)
+            if not bool(jnp.all(valid)):
+                raise ValueError("Invalid or ambiguous periodic center, or insufficient distinct active stencil nodes")
+            return ids,jnp.linalg.norm(images-queries[:,None,:],axis=-1)
+        if self.stencil_level_set is not None and not _euclidean:
+            return self._boundary_aware_knn(tree_mode, query_points, k, backend)
         _, points = self._get_tree_data(tree_mode)
         point_active = self.get_tree_active_mask(tree_mode)
         query_points = jnp.atleast_2d(jnp.asarray(query_points, dtype=float))
@@ -164,7 +262,21 @@ class DomainDescriptor:
                     selected_backend = "cpu"
                 else:
                     raise
-        return _jax_exact_knn(query_points, points, point_active, k=k)
+        if isinstance(query_points, jax.core.Tracer) or isinstance(points, jax.core.Tracer):
+            return _jax_exact_knn(query_points, points, point_active, k=k)
+        if query_points.shape[0] * points.shape[0] > _DENSE_KNN_MAX_PAIRS:
+            # Very large clouds: cell-blocked exact search, O(N k) work (accelerators/jax_spatial.grid_knn).
+            # Below this size the dense GPU top-k is faster for the large stencils of high orders.
+            from kernelpack.accelerators.jax_spatial import grid_knn
+            idx, dist = grid_knn(np.asarray(query_points), np.asarray(points), k, valid=np.asarray(point_active, bool))
+            return jnp.asarray(idx, dtype=int), jnp.asarray(dist, dtype=float)
+        # Dense top-k in row blocks, so that at most _DENSE_KNN_BLOCK_ENTRIES distances are held at once.
+        rows = max(1, int(_DENSE_KNN_BLOCK_ENTRIES // max(1, points.shape[0])))
+        if rows >= query_points.shape[0]:
+            return _jax_exact_knn(query_points, points, point_active, k=k)
+        parts = [_jax_exact_knn(query_points[s:s + rows], points, point_active, k=k)
+                 for s in range(0, query_points.shape[0], rows)]
+        return jnp.concatenate([a for a, _ in parts]), jnp.concatenate([b for _, b in parts])
 
     def query_ball(
         self,
@@ -180,6 +292,8 @@ class DomainDescriptor:
         if points.size == 0:
             return [jnp.zeros(0, dtype=int) for _ in range(query_points.shape[0])], [jnp.zeros(0, dtype=float) for _ in range(query_points.shape[0])]
         selected_backend = _resolve_backend(backend)
+        if self.periodic_bounds is not None:
+            selected_backend="jax"
         if selected_backend == "warp" and not bool(jnp.all(point_active)):
             selected_backend = "jax"
         if selected_backend == "warp":
@@ -189,7 +303,7 @@ class DomainDescriptor:
             except WarpUnavailableError:
                 if backend != "auto":
                     raise
-        d = jnp.where(point_active[None, :], distance_matrix(query_points, points), jnp.inf)
+        d = jnp.where(point_active[None, :], self._query_distances(points,query_points), jnp.inf)
         indices = []
         distances = []
         for row in d:
@@ -219,7 +333,7 @@ class DomainDescriptor:
         if points.size == 0:
             shape = (query_points.shape[0], 0)
             return jnp.zeros(shape, dtype=int), jnp.zeros(shape, dtype=float), jnp.zeros(shape, dtype=bool)
-        d = jnp.where(point_active[None, :], distance_matrix(query_points, points), jnp.inf)
+        d = jnp.where(point_active[None, :], self._query_distances(points,query_points), jnp.inf)
         valid = d <= float(radius)
         k = min(max(int(k_min), 0), int(points.shape[0]))
         if k > 0:
@@ -234,6 +348,24 @@ class DomainDescriptor:
 
     def get_tree_points(self, tree_mode: str) -> jnp.ndarray:
         return self._get_tree_data(tree_mode)[1]
+
+    def tree_indices_for_globals(self, tree_mode, global_ids):
+        """Map one-based global node identities to active tree rows on device.
+
+        A center outside this tree (or an inactive center) has index -1.
+        Coordinate equality never substitutes for node identity.
+        """
+        tree_globals = self.get_tree_globals(tree_mode)
+        global_ids = jnp.asarray(global_ids)
+        if tree_globals.size == 0:
+            return jnp.full(global_ids.shape, -1, dtype=jnp.int32)
+        # Every supported tree has contiguous global numbering; avoid sorting
+        # or an N-by-N coordinate comparison for this identity-only mapping.
+        indices = global_ids - tree_globals[0]
+        clipped = jnp.clip(indices, 0, tree_globals.size - 1)
+        found = (indices >= 0) & (indices < tree_globals.size)
+        found = found & self.get_tree_active_mask(tree_mode)[clipped]
+        return jnp.where(found, indices, -1).astype(jnp.int32)
 
     def get_tree_globals(self, tree_mode: str) -> jnp.ndarray:
         tree_mode = _normalize_tree_mode(tree_mode)

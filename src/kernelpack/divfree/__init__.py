@@ -13,6 +13,7 @@ from .core import (
     fit_local_divfree,
     fit_local_divfree_with_backend,
     knn_indices_jax,
+    prepare_divfree_local_system,
 )
 
 __all__ = [
@@ -30,4 +31,5 @@ __all__ = [
     "fit_local_divfree",
     "fit_local_divfree_with_backend",
     "knn_indices_jax",
+    "prepare_divfree_local_system",
 ]
