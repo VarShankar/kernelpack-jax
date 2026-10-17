@@ -48,6 +48,7 @@ def test_square_interpolation_farfield_and_full_blend_gradient():
 
 
 def test_cube_uses_mapped_affine_face_cover():
+    pytest.importorskip("warp")   # Warp Bridson sampling
     outline=np.array([[-1,-1],[1,-1],[1,1],[-1,1.]])
     surface=DomainNodeGenerator().build_piecewise_smooth_boundary_hierarchical(
         [outline]*6,[True]*6,[False]*6,[-1,1,-1,1,-1,1],[0,0,1,1,2,2],

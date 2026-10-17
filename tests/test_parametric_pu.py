@@ -98,6 +98,7 @@ def test_refinement_stops_when_new_supports_lack_data():
 
 
 def test_pu_face_hole_is_not_refilled():
+    pytest.importorskip("warp")   # Warp Bridson sampling
     outer=np.array([[-1,-1],[1,-1],[1,1],[-1,1.]])
     hole=np.array([[-.25,-.25],[.25,-.25],[.25,.25],[-.25,.25]])
     p=uv_grid(19); p=p[np.any(np.abs(p)>=.25,axis=1)]
@@ -137,6 +138,7 @@ def test_physical_roundoff_duplicates_are_coalesced_before_parameterization():
 
 
 def test_shared_builder_preserves_trimmed_curved_face_and_features():
+    pytest.importorskip("warp")   # Warp Bridson sampling
     outline=np.array([[-1,-1],[1,-1],[1,-.3],[-.3,-.3],[-.3,1],[-1,1.]])
     p=uv_grid(21); p=p[(p[:,0]<=-.3+1e-12)|(p[:,1]<=-.3+1e-12)]
     values=np.column_stack((p,.1*np.sum(p*p,axis=1)))

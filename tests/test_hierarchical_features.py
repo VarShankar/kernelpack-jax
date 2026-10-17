@@ -1,3 +1,4 @@
+import pytest
 import numpy as np
 import jax.numpy as jnp
 from scipy.spatial import cKDTree
@@ -8,6 +9,7 @@ from kernelpack.accelerators import warp_assembled_boundary_keep_mask
 
 
 def test_concave_face_preserves_footprint_vertices_and_spacing():
+    pytest.importorskip("warp")   # Warp Bridson sampling
     # L-shaped face: convex-hull filling would place nodes in the missing arm.
     outline = np.array([[0,0],[1,0],[1,.3],[.3,.3],[.3,1],[0,1.]])
     features = np.column_stack([outline, np.full(len(outline), .4)])
@@ -28,6 +30,7 @@ def test_concave_face_preserves_footprint_vertices_and_spacing():
 
 
 def test_feature_duplicate_priority_and_ghost_direction():
+    pytest.importorskip("warp")   # Warp Bridson sampling
     outline = np.array([[0,0],[1,0],[1,1],[0,1.]])
     # An edge candidate comes first and lies within duplicate tolerance of a
     # vertex. The vertex must survive, including its incident-normal direction.
@@ -54,6 +57,7 @@ def test_polygon_orientation_and_boundary_inclusion():
 
 
 def test_priority_thinning_is_separated_and_covers_all_candidates():
+    pytest.importorskip("warp")   # Warp Bridson sampling
     # Higher-priority geometry arrives later, after a nearby lower-priority
     # feature. Neither duplicate removal nor arrival order may discard it.
     points = np.array([[0,0,0],[.019,0,0],[.109,0,0],[-.09,0,0]],float)

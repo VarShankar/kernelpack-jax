@@ -5,7 +5,7 @@ from functools import lru_cache, partial
 from math import ceil
 from typing import Callable
 
-from jax import jit, vmap, lax, custom_jvp, jvp
+from jax import jit, vmap, lax, custom_jvp, jvp, ensure_compile_time_eval
 from jax import scipy as jsp
 import jax.numpy as jnp
 
@@ -129,8 +129,10 @@ def _build_legendre_basis(dim: int, ell: int) -> PolynomialBasis:
 
 @lru_cache(maxsize=None)
 def _build_legendre_basis_data(dim: int, ell: int) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    basis = _build_legendre_basis(dim, ell)
-    return basis.index_set, basis.recurrence_a, basis.recurrence_b
+    # Concrete even when first called inside a trace (e.g. lax.scan in rbffd/moving.py); the result is cached.
+    with ensure_compile_time_eval():
+        basis = _build_legendre_basis(dim, ell)
+        return basis.index_set, basis.recurrence_a, basis.recurrence_b
 
 
 @jit
