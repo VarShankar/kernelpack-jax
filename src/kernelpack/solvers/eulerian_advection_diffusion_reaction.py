@@ -692,9 +692,11 @@ class EulerianAdvectionDiffusionReactionSolver:
 
         h_value = float(self.domain.get_sep_rad() if h is None else h)
         khat = float(2.0 / h_value if wavenumber is None else wavenumber)
-        phase_all = khat * np.asarray(jnp.sum(self.xall, axis=1))
-        f_all = np.exp(1j * phase_all)
+        # Plane wave exp(i khat (x_1 + ... + x_d)) on the device (complex128 under x64).
+        phase_all = khat * jnp.sum(self.xall, axis=1)
+        f_all = jnp.exp(1j * phase_all)
         f_phys = f_all[: self.n]
+        f_phys_norm = float(jnp.linalg.norm(f_phys))
         full_sp = StencilProperties(
             n=self.lap_stencil_properties.n,
             dim=self.dim,
@@ -749,10 +751,14 @@ class EulerianAdvectionDiffusionReactionSolver:
             print(f"[gamma] component {d} q/gamma calculation start", flush=True)
             tau = float(np.real(lr))
             tau_safe = max(abs(tau), np.finfo(float).tiny)
-            approx = _to_scipy_coo(self.grad_sparse[d]).dot(f_all)
+            # Device SpMV of the real COO gradient with the complex plane wave (real and imaginary parts).
+            grad = self.grad_sparse[d]
+            rows = int(grad.shape[0])
+            approx = (sparse_matvec(grad.indices, grad.values, rows, jnp.real(f_all))
+                      + 1j * sparse_matvec(grad.indices, grad.values, rows, jnp.imag(f_all)))
             exact = 1j * khat * f_phys
-            residual = max(float(np.linalg.norm(exact - approx)), np.finfo(float).tiny)
-            scale = max(tau_safe * float(np.linalg.norm(f_phys)), np.finfo(float).tiny)
+            residual = max(float(jnp.linalg.norm(exact - approx)), np.finfo(float).tiny)
+            scale = max(tau_safe * f_phys_norm, np.finfo(float).tiny)
             q = float((np.log(residual) - np.log(scale)) / np.log(khat))
             gamma = paper_gamma_component(
                 h_value,

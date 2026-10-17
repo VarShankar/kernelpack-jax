@@ -12,6 +12,10 @@ which is divergence-free and vanishes on the boundary. The center c is the cente
 the reference boundary nodes, and each field is divided by a fixed scale: its maximum speed over X0, the
 points of a uniform grid (spacing NORMALIZATION_SPACING) inside the exact domain, which does not depend
 on any cloud. All of these are fixed per geometry.
+
+The point set X0, the reference level set and every normalization scale are computed once per geometry
+(and family) and cached; per cloud, only the fields at the cloud's nodes are evaluated, on the device.
+X0 itself is built once on the host (meshgrid + the exact inside test of cfpu_classification_study).
 """
 from __future__ import annotations
 
@@ -81,29 +85,52 @@ def _forward_mode(x, center):
     return .5 * (s[:, 0] ** 2 + s[:, 2] ** 2), jnp.column_stack((s[:, 0], jnp.zeros_like(s[:, 0]), s[:, 2]))
 
 
+def _forward_field(geometry: str, points):
+    level_set, center, _ = reference(geometry)
+    m, gm = _forward_mode(points, center)
+    f = _curl_fields(level_set, center, points, [(m, gm)] * 2)
+    return f[1] if points.shape[1] == 3 else f[0]                                        # 3D: curl(psi e_y)
+
+
+@lru_cache(maxsize=None)
+def _forward_scale(geometry: str) -> float:
+    """max_{X0} |w| of the forward base field (fixed per geometry, evaluated once)."""
+    x0 = reference(geometry)[2]
+    return float(jnp.max(jnp.linalg.norm(_forward_field(geometry, x0), axis=1)))
+
+
 def forward_velocity(geometry: str, x):
     """Unit-scale forward AD field w/max_{X0}|w| at points x (the paper's base field, mode q, axis e_y in 3D)."""
-    level_set, center, x0 = reference(geometry)
-    def field(points):
-        m, gm = _forward_mode(points, center)
-        f = _curl_fields(level_set, center, points, [(m, gm)] * 2)
-        return f[1] if points.shape[1] == 3 else f[0]                                    # 3D: curl(psi e_y)
-    scale = float(jnp.max(jnp.linalg.norm(field(x0), axis=1)))
-    return field(jnp.asarray(x)) / scale
+    return _forward_field(geometry, jnp.asarray(x)) / _forward_scale(geometry)
+
+
+def _transport_fields(geometry: str, family: str, points):
+    level_set, center, _ = reference(geometry)
+    modes = [_mode_and_gradient(family, i, points, center) for i in range(3)]
+    return _curl_fields(level_set, center, points, modes)
+
+
+@lru_cache(maxsize=None)
+def _transport_scales(geometry: str, family: str) -> tuple:
+    """max_{X0} |w_i| of the three transport basis fields (fixed per geometry and family, evaluated once)."""
+    x0 = reference(geometry)[2]
+    return tuple(float(jnp.max(jnp.linalg.norm(f, axis=1))) for f in _transport_fields(geometry, family, x0))
 
 
 def transport_basis(geometry: str, family: str, x):
     """Three fixed unit-scale basis fields (3, n, d) at points x for the transport inverse."""
-    level_set, center, x0 = reference(geometry)
-    def fields(points):
-        modes = [_mode_and_gradient(family, i, points, center) for i in range(3)]
-        return _curl_fields(level_set, center, points, modes)
-    scales = [float(jnp.max(jnp.linalg.norm(f, axis=1))) for f in fields(x0)]
-    return jnp.stack([f / s for f, s in zip(fields(jnp.asarray(x)), scales)])
+    scales = _transport_scales(geometry, family)
+    return jnp.stack([f / s for f, s in zip(_transport_fields(geometry, family, jnp.asarray(x)), scales)])
+
+
+@lru_cache(maxsize=None)
+def _transport_theta_factor(geometry: str, family: str, theta_reference: tuple, speed: float) -> float:
+    theta = jnp.asarray(theta_reference)
+    v = jnp.einsum("i,ind->nd", theta, transport_basis(geometry, family, reference(geometry)[2]))
+    return speed / float(jnp.max(jnp.linalg.norm(v, axis=1)))
 
 
 def transport_theta(geometry: str, family: str, theta_reference, speed: float):
     """True coefficients: theta_reference scaled so that max_{X0} |sum_i theta_i w_i| = speed (fixed per geometry)."""
-    level_set, center, x0 = reference(geometry)
-    v = jnp.einsum("i,ind->nd", theta_reference, transport_basis(geometry, family, x0))
-    return theta_reference * (speed / float(jnp.max(jnp.linalg.norm(v, axis=1))))
+    key = tuple(float(t) for t in np.asarray(theta_reference).reshape(-1))
+    return theta_reference * _transport_theta_factor(geometry, family, key, float(speed))

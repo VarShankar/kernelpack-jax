@@ -2,7 +2,6 @@
 import numpy as np
 import jax.numpy as jnp
 from jax import jit, lax
-from scipy.spatial import cKDTree
 
 
 @jit
@@ -29,17 +28,17 @@ def _off_outline_masked(points, start, end, edge_valid, tolerance):
 
 
 def _off_outline_bucketed(points, outline):
-    """``_off_outline`` with power-of-two padded points and edges."""
-    from kernelpack.accelerators.jax_spatial import bucket, pad_rows
-    pts=np.asarray(points,float); loop=np.asarray(outline,float)
-    if not len(pts): return np.zeros(0,bool)
+    """``_off_outline`` with power-of-two padded points and edges; device mask."""
+    from kernelpack.accelerators.jax_spatial import bucket, pad_rows, pad_rows_device
+    pts=jnp.asarray(points,float); loop=np.asarray(outline,float)
+    if not pts.shape[0]: return jnp.zeros(0,bool)
     m=len(loop); m_pad=bucket(m,8)
     start=pad_rows(loop,m_pad,0.); end=pad_rows(np.roll(loop,-1,axis=0),m_pad,0.)
     valid=np.arange(m_pad)<m
     tolerance=1e-12*max(1.,float(np.linalg.norm(np.ptp(loop,axis=0))))
-    out=_off_outline_masked(jnp.asarray(pad_rows(pts,bucket(len(pts),256),0.)),jnp.asarray(start),jnp.asarray(end),
+    out=_off_outline_masked(pad_rows_device(pts,bucket(pts.shape[0],256),0.),jnp.asarray(start),jnp.asarray(end),
         jnp.asarray(valid),tolerance)
-    return np.array(out)[:len(pts)]
+    return out[:pts.shape[0]]
 
 
 def feature_graded_cfpu_sites(surface, *, factor=2., bandwidth=2., seed=11, backend='auto'):
@@ -54,28 +53,29 @@ def feature_graded_cfpu_sites(surface, *, factor=2., bandwidth=2., seed=11, back
     from .core import _assembled_boundary_keep_mask
     if not np.isfinite(factor) or factor<1 or not np.isfinite(bandwidth) or bandwidth<=0:
         raise ValueError('finite feature factor >=1 and positive bandwidth required')
-    points=np.asarray(surface.xb_uniform); normals=np.asarray(surface.nrmls_uniform)
+    from kernelpack.accelerators.jax_spatial import compact_rows, nearest_within
+    points=jnp.asarray(surface.xb_uniform,float); normals=jnp.asarray(surface.nrmls_uniform,float)
     # The features of the assembled boundary: supplied, or derived from the trimming loops.
     derived=getattr(surface,'derived_features',())
-    features=[np.asarray(surface.feature_sites)] if len(surface.feature_sites) else (
-        [np.asarray(derived[0])] if len(derived) and len(derived[0]) else [])
-    diagnostic=dict(factor=float(factor),bandwidth=float(bandwidth),baseline_count=len(points),
+    features=(jnp.asarray(surface.feature_sites,float) if len(surface.feature_sites) else
+        jnp.asarray(derived[0],float) if len(derived) and len(derived[0]) else None)
+    diagnostic=dict(factor=float(factor),bandwidth=float(bandwidth),baseline_count=int(points.shape[0]),
         added_count=0,per_piece_added={},new_normals='incident smooth-piece normals',
         original_feature_constraints='preserved unchanged')
-    if factor==1 or not features: return points,normals,diagnostic
+    if factor==1 or features is None: return points,normals,diagnostic
     h=float(surface.sep_rad)
     if h<=0: raise ValueError('feature enrichment requires an assembled physical separation radius')
-    from kernelpack.accelerators.jax_spatial import nearest_within
-    feature_points=np.unique(np.vstack(features),axis=0)
+    # Only distances to the feature set are used: duplicates and order do not matter.
+    feature_points=features
     extra=[]; extra_normals=[]; owners=[]
     for index,segment in enumerate(surface.segments):
         model=segment.geom_model; kind=model.get('type')
         if kind=='parametric-pu':
             pu=model['model']; loops=model['outlines']
             if segment.surf_dim==1:
-                uv=sample_parametric_curve(pu,loops,h/factor,supersample_fac=2)
+                uv=jnp.asarray(sample_parametric_curve(pu,loops,h/factor,supersample_fac=2))
                 interval=np.asarray(loops[0])[:,0]
-                uv=uv[(uv[:,0]>interval[0]+1e-12)&(uv[:,0]<interval[1]-1e-12)]
+                uv=compact_rows((uv[:,0]>interval[0]+1e-12)&(uv[:,0]<interval[1]-1e-12),uv)
             else:
                 uv=sample_parametric_face(pu,loops,h/factor,seed=seed+index,
                     backend=backend,supersample_fac=2)
@@ -94,26 +94,27 @@ def feature_graded_cfpu_sites(surface, *, factor=2., bandwidth=2., seed=11, back
         else: raise ValueError('feature enrichment requires shared PU or affine pieces')
         # Device nearest-feature distance (exact within the band), outline tests
         # and final thinning.
-        uv=np.asarray(uv); xyz=np.asarray(xyz)
+        uv=jnp.asarray(uv,float); xyz=jnp.asarray(xyz,float)
         keep=nearest_within(xyz,feature_points,bandwidth*h)[0]<bandwidth*h
-        uv=uv[keep]; xyz=xyz[keep]
         if kind!='spherical-pu' and uv.shape[1]==2:
-            off=np.ones(len(uv),dtype=bool)
-            for loop in loops: off &= _off_outline_bucketed(uv,np.asarray(loop))
-            uv=uv[off]; xyz=xyz[off]
-        if not len(uv): continue
+            for loop in loops: keep&=_off_outline_bucketed(uv,np.asarray(loop))
+        uv,xyz=compact_rows(keep,uv,xyz)
+        if not uv.shape[0]: continue
         if kind in ('parametric-pu','spherical-pu'):
             _,nr=pu.frame(uv); nr*=model.get('normal_sign',1.)
         else: nr=jnp.broadcast_to(jnp.asarray(model['normal']),xyz.shape)
-        extra.append(np.asarray(xyz)); extra_normals.append(np.asarray(nr))
-        owners.extend([index]*len(uv))
+        extra.append(xyz); extra_normals.append(jnp.asarray(nr,float))
+        owners.append(np.full(uv.shape[0],index))
     if not extra: return points,normals,diagnostic
-    candidates=np.vstack([points,*extra]); values=np.vstack([normals,*extra_normals])
-    priority=jnp.r_[jnp.ones(len(points)),jnp.zeros(len(candidates)-len(points))]
-    keep=np.asarray(_assembled_boundary_keep_mask(jnp.asarray(candidates),priority,h/factor))
-    if not keep[:len(points)].all(): raise ValueError('feature enrichment changed baseline fit sites')
-    retained=np.array(owners)[keep[len(points):]]
-    diagnostic.update(added_count=int(keep[len(points):].sum()),
-        per_piece_added={int(i):int((retained==i).sum()) for i in np.unique(retained)},
-        fit_spacing=h/factor,feature_band=bandwidth*h,candidate_count=len(candidates))
-    return candidates[keep],values[keep],diagnostic
+    candidates=jnp.vstack([points,*extra]); values=jnp.vstack([normals,*extra_normals])
+    n_base=int(points.shape[0])
+    priority=jnp.r_[jnp.ones(n_base),jnp.zeros(candidates.shape[0]-n_base)]
+    keep=_assembled_boundary_keep_mask(candidates,priority,h/factor)
+    if not bool(jnp.all(keep[:n_base])): raise ValueError('feature enrichment changed baseline fit sites')
+    retained=np.asarray(jnp.bincount(jnp.asarray(np.concatenate(owners)),weights=keep[n_base:].astype(int),
+        length=len(surface.segments)))
+    diagnostic.update(added_count=int(retained.sum()),
+        per_piece_added={int(i):int(c) for i,c in enumerate(retained) if c},
+        fit_spacing=h/factor,feature_band=bandwidth*h,candidate_count=int(candidates.shape[0]))
+    points,normals=compact_rows(keep,candidates,values)
+    return points,normals,diagnostic

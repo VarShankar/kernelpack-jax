@@ -162,39 +162,55 @@ class DomainDescriptor:
         self.stencil_level_set = StencilLevelSet(model, self.sep_rad if h is None else h, **options)
         self._stencil_phi_nodes = {}
         self._stencil_memo = {}
+        self._stencil_owner = {}
 
     def _boundary_aware_knn(self, tree_mode: str, query_points, k: int, backend: str):
         from kernelpack.domain.boundary_aware import boundary_aware_knn
         tree_mode = _normalize_tree_mode(tree_mode)
         _, points = self._get_tree_data(tree_mode)
         n_tree = int(points.shape[0])
-        K = min(4 * int(k), n_tree)
-        idx, dist = self.query_knn(tree_mode, query_points, K, backend=backend, _euclidean=True)
-        idx, dist = np.asarray(idx), np.asarray(dist)
-        q = np.atleast_2d(np.asarray(query_points, dtype=float))
-        if not (np.linalg.norm(np.asarray(points)[idx[:, 0]] - q, axis=1) <= 1e-12 * (1 + np.abs(q).max())).all():
-            return jnp.asarray(idx[:, :k]), jnp.asarray(dist[:, :k])   # centers that are not tree points: Euclidean
-        owner = np.arange(n_tree)
-        if tree_mode == "all":
-            ni, nb, ng = self.get_num_interior_nodes(), self.get_num_bdry_nodes(), int(self.xg.shape[0])
-            if ng == nb:
-                owner[ni + nb:] = ni + np.arange(ng)   # ghost i belongs to boundary node i
-        key = (tree_mode, int(k), q.shape, hash(q.tobytes()))
+        q = jnp.atleast_2d(jnp.asarray(query_points, dtype=float))
+        # Memo of selected stencils, keyed by a device fingerprint of the query and confirmed by equality.
         memo = getattr(self, "_stencil_memo", {})
-        if key in memo:
-            return memo[key]
+        key = (tree_mode, int(k), tuple(q.shape), tuple(_query_fingerprint(q).tolist()))
+        hit = memo.get(key)
+        if hit is not None and bool(jnp.array_equal(hit[0], q)):
+            return hit[1]
+        K = min(4 * int(k), n_tree)
+        idx, dist = self.query_knn(tree_mode, q, K, backend=backend, _euclidean=True)
+        if not bool(_centers_are_tree_points(points, idx[:, 0], q)):
+            return idx[:, :k], dist[:, :k]                   # centers that are not tree points: Euclidean
+        ni, nb, ng = self.get_num_interior_nodes(), self.get_num_bdry_nodes(), int(self.xg.shape[0])
+        owners = getattr(self, "_stencil_owner", {})
+        if (tree_mode, ni, nb, ng) not in owners:
+            owner = jnp.arange(n_tree)
+            if tree_mode == "all" and ng == nb:
+                owner = jnp.concatenate([jnp.arange(ni + nb), ni + jnp.arange(ng)])   # ghost i -> boundary node i
+            owners[(tree_mode, ni, nb, ng)] = owner
+            self._stencil_owner = owners
         cache = getattr(self, "_stencil_phi_nodes", {})
         if tree_mode not in cache:
-            cache[tree_mode] = self.stencil_level_set(np.asarray(points))
+            cache[tree_mode] = self.stencil_level_set(points)
             self._stencil_phi_nodes = cache
         stats = {}
-        out_i, out_d = boundary_aware_knn(np.asarray(points), owner, cache[tree_mode], idx, dist, int(k),
+        out_i, out_d = boundary_aware_knn(points, owners[(tree_mode, ni, nb, ng)], cache[tree_mode], idx, dist, int(k),
                                           self.stencil_level_set, stats=stats)
         self.stencil_stats = {key: self.stencil_stats.get(key, 0) + val for key, val in stats.items()} | {
             "queries": self.stencil_stats.get("queries", 0) + 1}
-        memo[key] = (jnp.asarray(out_i, dtype=int), jnp.asarray(out_d, dtype=float))
+        memo[key] = (q, (jnp.asarray(out_i, dtype=int), jnp.asarray(out_d, dtype=float)))
         self._stencil_memo = memo
-        return memo[key]
+        return memo[key][1]
+
+    def _active_count(self, tree_mode: str) -> int:
+        """Number of active tree points, cached while the active masks are the same arrays."""
+        refs = (self.interior_active, self.boundary_active, self.ghost_active)
+        cached = getattr(self, "_active_counts", None)
+        if cached is None or any(a is not b for a, b in zip(cached[0], refs)):
+            cached = (refs, {})
+            self._active_counts = cached
+        if tree_mode not in cached[1]:
+            cached[1][tree_mode] = int(jnp.count_nonzero(self.get_tree_active_mask(tree_mode)))
+        return cached[1][tree_mode]
 
     def set_outer_level_set(self, level_set: object) -> None:
         self.outer_level_set = level_set
@@ -242,7 +258,7 @@ class DomainDescriptor:
         if points.size == 0:
             return jnp.zeros((query_points.shape[0], 0), dtype=int), jnp.zeros((query_points.shape[0], 0), dtype=float)
         k = min(int(k), points.shape[0])
-        if k > int(jnp.count_nonzero(point_active)):
+        if k > self._active_count(tree_mode):
             raise ValueError("KNN stencil size exceeds the number of active tree points")
         selected_backend = _resolve_backend(backend)
         if selected_backend == "warp":
@@ -459,6 +475,27 @@ class DomainDescriptor:
     def _build_tree_struct(points: jnp.ndarray) -> TreeStruct:
         points = jnp.asarray(points, dtype=float)
         return TreeStruct(points=points, searcher=None, has_searcher=False)
+
+
+@jax.jit
+def _query_fingerprint(q):
+    """Two order-dependent hashes of the bits of q (a memo key; hits are confirmed by equality)."""
+    utype = {8: jnp.uint64, 4: jnp.uint32, 2: jnp.uint16}[q.dtype.itemsize]
+    bits = lax.bitcast_convert_type(q.reshape(-1), utype)
+    i = jnp.arange(bits.shape[0], dtype=utype)
+    mixed = bits ^ (bits >> 13)
+    return jnp.stack([jnp.sum(mixed * (2 * i + 1), dtype=utype),
+                      jnp.sum((bits + i) * (mixed | 1), dtype=utype)])
+
+
+@jax.jit
+def _centers_are_tree_points(points, center_idx, q):
+    """Whether the nearest tree point of every query coincides with it (up to rounding)."""
+    diff = points[center_idx] - q
+    sq = diff[:, 0] * diff[:, 0]
+    for i in range(1, diff.shape[1]):
+        sq = sq + diff[:, i] * diff[:, i]
+    return jnp.all(jnp.sqrt(sq) <= 1e-12 * (1 + jnp.max(jnp.abs(q))))
 
 
 def _normalize_tree_mode(mode: str) -> str:

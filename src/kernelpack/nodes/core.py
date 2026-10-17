@@ -1158,33 +1158,39 @@ def _gpu_interior_sample(geometry, xb, nrmls, level_set, radius, *, seed, do_out
     """
     from kernelpack.accelerators.jax_spatial import nearest_within, poisson_disk_sample
     x_min, x_max = bounding_box_extents(geometry, True)
-    xb_np = np.asarray(xb, dtype=float)
-    nb_np = np.asarray(nrmls, dtype=float)
+    xb = jnp.asarray(xb, dtype=float)
+    nb = jnp.asarray(nrmls, dtype=float)
     fine = float(outer_fraction_of_h * radius) if do_outer_refinement else float(radius)
     clearance = fine
 
     def radius_of(points):
         if not do_outer_refinement or zone <= 0 or fine >= radius:
-            return np.full(len(points), float(radius))
-        d, _ = nearest_within(points, xb_np, float(zone))
-        return np.where(np.isfinite(d), fine, float(radius))
+            return jnp.full(points.shape[0], float(radius))
+        d, _ = nearest_within(points, xb, float(zone))
+        return jnp.where(jnp.isfinite(d), fine, float(radius))
 
     if clearance_mode == "seeds":
-        fixed = np.vstack([xb_np, xb_np + GHOST_OFFSET_FRACTION * float(radius) * nb_np])
+        fixed = jnp.vstack([xb, ghost_nodes(xb, nb, radius)])
         guard = float(surface_guard_fraction) * float(radius)
     else:
         fixed = None
         guard = clearance
 
     def accept(points):
-        phi = np.asarray(level_set.evaluate(jnp.asarray(points)))
-        return np.isfinite(phi) & (phi >= guard)
+        phi = jnp.asarray(level_set.evaluate(points))
+        return jnp.isfinite(phi) & (phi >= guard)
 
     x = poisson_disk_sample(np.asarray(x_min, float), np.asarray(x_max, float), radius_of, fine, seed=seed,
                             accept=accept, fixed_points=fixed, fixed_radii=clearance)
-    info = {"dimension": int(xb_np.shape[1]), "mode": "gpu_greedy_independent_set", "radius": float(radius),
-            "min_radius": fine, "seed": int(seed), "num_points": int(len(x)), "backend": "jax"}
-    return jnp.asarray(x), info
+    info = {"dimension": int(xb.shape[1]), "mode": "gpu_greedy_independent_set", "radius": float(radius),
+            "min_radius": fine, "seed": int(seed), "num_points": int(x.shape[0]), "backend": "jax"}
+    return x, info
+
+
+def ghost_nodes(xb, nrmls, radius):
+    """``x_b + GHOST_OFFSET_FRACTION * radius * n_b``, as separate device ops (no multiply-add
+    contraction, so the result equals the numpy expression bit for bit)."""
+    return jnp.asarray(xb, dtype=float) + (GHOST_OFFSET_FRACTION * float(radius)) * jnp.asarray(nrmls, dtype=float)
 
 
 def clip_points_by_geometry(
@@ -1228,13 +1234,14 @@ def clip_points_by_geometry(
         float(max_signed_distance),
     )
     if fixed_points is not None and fixed_point_clearance > 0.0:
-        from scipy.spatial import cKDTree
-
-        fixed = np.asarray(fixed_points, dtype=float)
+        from kernelpack.accelerators.jax_spatial import nearest_within
+        fixed = jnp.asarray(fixed_points, dtype=float)
         if fixed.size:
-            distance = cKDTree(fixed).query(np.asarray(x, dtype=float))[0]
-            keep_mask = keep_mask & jnp.asarray(distance >= float(fixed_point_clearance))
-    return x[keep_mask], keep_mask, phi
+            # Exact (scipy-identical) nearest distance where it is <= clearance, else inf.
+            distance, _ = nearest_within(x, fixed, float(fixed_point_clearance), ordered=True)
+            keep_mask = keep_mask & (distance >= float(fixed_point_clearance))
+    from kernelpack.accelerators.jax_spatial import compact_rows
+    return compact_rows(keep_mask, x), keep_mask, phi
 
 
 def _ensure_geometry_level_set(geometry: object, auto_build: bool) -> RBFLevelSet:
@@ -1387,7 +1394,7 @@ class DomainNodeGenerator:
 
         clearance = outer_fraction_of_h * radius if do_outer_refinement else radius
         if clearance_mode == "seeds":
-            seeds = jnp.vstack([xb, xb + GHOST_OFFSET_FRACTION * radius * nrmls])
+            seeds = jnp.vstack([xb, ghost_nodes(xb, nrmls, radius)])
             self.clip_to_geometry(geometry, keep="inside", boundary_clearance=surface_guard_fraction * radius,
                                   fixed_points=seeds, fixed_point_clearance=clearance)
         else:
@@ -1411,13 +1418,14 @@ class DomainNodeGenerator:
         self.s_dim = x.shape[1]
         self.last_info["clip_mask"] = mask
         self.last_info["clip_count"] = x.shape[0]
-        self.last_info["clip_levelset_values"] = phi[mask]
+        from kernelpack.accelerators.jax_spatial import compact_rows
+        self.last_info["clip_levelset_values"] = compact_rows(mask, phi)
         return x, mask, phi
 
     def build_domain_descriptor_from_geometry(self, geometry: object, radius: float, **kwargs: object) -> DomainDescriptor:
         self.generate_interior_nodes_from_geometry(geometry, radius, **kwargs)
         xb, nrmls, level_set = _build_boundary_state(geometry)
-        xg = xb + GHOST_OFFSET_FRACTION * radius * nrmls
+        xg = ghost_nodes(xb, nrmls, radius)
         descriptor = DomainDescriptor()
         descriptor.set_nodes(self.xi, xb, xg)
         descriptor.set_normals(nrmls)

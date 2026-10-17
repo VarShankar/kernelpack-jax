@@ -334,8 +334,8 @@ def assemble_operator_sparse(
         dir_coeff=dir_coeff,
         stencil_graph=stencil_graph,
     )
-    indices = np.asarray(assembler.locations, dtype=np.int64) - 1
-    values = np.asarray(assembler.values, dtype=np.float64)
+    indices = jnp.asarray(assembler.locations, dtype=int) - 1
+    values = jnp.asarray(assembler.values, dtype=float)
     return SparseCOOMatrix(
         indices=jnp.asarray(indices, dtype=int),
         values=jnp.asarray(values, dtype=float),
@@ -387,8 +387,8 @@ def assemble_operator_sparse_chunked(
         row_count = int(stencil_graph.active_rows.shape[0])
         graph_mode = "supplied"
 
-    index_chunks: list[np.ndarray] = []
-    value_chunks: list[np.ndarray] = []
+    index_chunks: list[jnp.ndarray] = []
+    value_chunks: list[jnp.ndarray] = []
     n1 = 0
     n2 = 0
     sparse_op_properties = replace(op_properties, sparse_only=True) if hasattr(op_properties, "sparse_only") else op_properties
@@ -433,11 +433,11 @@ def assemble_operator_sparse_chunked(
         )
         n1 = max(n1, int(assembler.n1))
         n2 = max(n2, int(assembler.n2))
-        # Materialize the solve-dependent values before locations. This blocks
-        # the current chunk and permits its temporary factorization buffers to
-        # be reclaimed before the next chunk is dispatched.
-        value_chunks.append(np.asarray(jax.device_get(assembler.values), dtype=np.float64))
-        index_chunks.append(np.asarray(jax.device_get(assembler.locations), dtype=np.int64) - 1)
+        # The chunks stay on the device. Waiting for the values (no transfer) lets the
+        # temporary factorization buffers of this chunk be reclaimed before the next
+        # chunk is dispatched, and keeps the per-chunk timing meaningful.
+        value_chunks.append(jnp.asarray(assembler.values, dtype=float).block_until_ready())
+        index_chunks.append(jnp.asarray(assembler.locations, dtype=int) - 1)
         del assembler
         print(
             "[assembly] chunk done: "
@@ -449,11 +449,12 @@ def assemble_operator_sparse_chunked(
     concat_start = time.perf_counter()
     print(f"[assembly] concatenate start: op={op_name}, chunks={chunk_count}", flush=True)
     if index_chunks:
-        indices = np.concatenate(index_chunks, axis=0)
-        values = np.concatenate(value_chunks, axis=0)
+        indices = jnp.concatenate(index_chunks, axis=0)
+        values = jnp.concatenate(value_chunks, axis=0)
     else:
-        indices = np.zeros((0, 2), dtype=np.int64)
-        values = np.zeros((0,), dtype=np.float64)
+        indices = jnp.zeros((0, 2), dtype=int)
+        values = jnp.zeros((0,), dtype=float)
+    del index_chunks, value_chunks
     print(
         "[assembly] chunked sparse assembly done: "
         f"op={op_name}, nnz={values.shape[0]}, concat_elapsed={time.perf_counter() - concat_start:.3f}s, "

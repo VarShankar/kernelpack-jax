@@ -13,8 +13,10 @@ normals of all incident pieces agree to within SMOOTH_SEAM_DEGREES (pieces that 
 charts, as for a closed curve or surface).
 """
 import numpy as np
+import jax
 import jax.numpy as jnp
-from scipy.spatial import cKDTree
+
+from kernelpack.accelerators.jax_spatial import compact_rows, nearest_within_sparse, row_norm
 
 SITE_SPACING = .25       # sites per loop edge at spacing <= SITE_SPACING * h
 DENSE_SPACING = 1 / 64   # incidence test against loops resolved at this spacing * h
@@ -23,66 +25,87 @@ SMOOTH_SEAM_DEGREES = 2.   # incident normals within this angle: a smooth seam, 
 
 
 def _loop_samples(segment, loop, spacing):
-    """Parameters on a closed parameter-space loop: every vertex and points at physical spacing <= spacing."""
-    uv = np.asarray(loop, float)
-    xyz = np.asarray(segment.evaluate_parametric(jnp.asarray(uv)))
-    nxt = np.roll(np.arange(len(uv)), -1)
-    lengths = np.linalg.norm(xyz[nxt] - xyz, axis=1)
+    """Parameters on a closed parameter-space loop: every vertex and points at physical spacing <= spacing.
+
+    Device array; the per-edge counts (static shapes) come from the mapped loop vertices."""
+    uv_h = np.asarray(loop, float)
+    uv = jnp.asarray(uv_h)
+    xyz = jnp.asarray(segment.evaluate_parametric(uv))
+    nxt = np.roll(np.arange(len(uv_h)), -1)
+    lengths = np.asarray(row_norm(xyz[nxt] - xyz))
     counts = np.maximum(1, np.ceil(lengths / spacing).astype(int))
-    pieces = [uv[i] + (np.arange(c)[:, None] / c) * (uv[nxt[i]] - uv[i]) for i, c in enumerate(counts)]
-    return np.vstack(pieces)
+    edge = np.repeat(np.arange(len(uv_h)), counts)
+    t = np.concatenate([np.arange(c) / c for c in counts])[:, None]
+    a = uv[edge]
+    # a + t (b - a) as separate device ops (no multiply-add contraction), as numpy evaluates it.
+    return a + _product(jnp.asarray(t), uv[nxt[edge]] - a)
+
+
+@jax.jit
+def _product(t, d):
+    return jax.lax.optimization_barrier(t * d)
 
 
 def _piece_loop_points(segment, spacing):
-    """Physical points, parameters and normals of a piece's mapped trimming loops."""
+    """Physical points and unit normals of a piece's mapped trimming loops (device)."""
     model = segment.geom_model
     loops = model.get("outlines")
     if loops is None or not len(loops):
-        return np.zeros((0, 0)), np.zeros((0, 0))
+        return None, None
     if segment.surf_dim == 1:
-        uv = np.asarray(loops[0], float).reshape(-1, 1)          # the two endpoints of a curve
+        uv = jnp.asarray(np.asarray(loops[0], float).reshape(-1, 1))   # the two endpoints of a curve
     else:
-        uv = np.vstack([_loop_samples(segment, loop, spacing) for loop in loops])
-    uvj = jnp.asarray(uv)
-    x = np.asarray(segment.evaluate_parametric(uvj))
-    n = np.asarray(segment.evaluate_parametric_frame(uvj)[-1], float)
-    n = n / np.linalg.norm(n, axis=1, keepdims=True)
-    return x, n
+        uv = jnp.concatenate([_loop_samples(segment, loop, spacing) for loop in loops])
+    x = jnp.asarray(segment.evaluate_parametric(uv), float)
+    n = jnp.asarray(segment.evaluate_parametric_frame(uv)[-1], float)
+    return x, n / row_norm(n)[:, None]
+
+
+@jax.jit
+def _dot_rows(a, b):
+    """Row dot products summed in coordinate order without contraction (numpy's np.sum(a * b, axis=1))."""
+    p = jax.lax.optimization_barrier(a * b)
+    s = p[:, 0]
+    for k in range(1, p.shape[1]):
+        s = s + p[:, k]
+    return s
 
 
 def derive_features(segments, h, smooth_seam_degrees=SMOOTH_SEAM_DEGREES):
-    """Feature sites, unit normals, and integer priorities for spacing h (see the module docstring)."""
+    """Feature sites, unit normals, and integer priorities for spacing h (see the module docstring); device arrays."""
     h = float(h)
     sites, dense = [], []
     for segment in segments:
         sites.append(_piece_loop_points(segment, SITE_SPACING * h)[0])
         dense.append(_piece_loop_points(segment, DENSE_SPACING * h))
-    sites = [s for s in sites if s.size]
+    sites = [s for s in sites if s is not None and s.size]
     if not sites:
-        return np.zeros((0, 0)), np.zeros((0, 0)), np.zeros(0, int)
-    x = np.vstack(sites)
+        return jnp.zeros((0, 0)), jnp.zeros((0, 0)), jnp.zeros(0, int)
+    x = jnp.concatenate(sites)
     d = x.shape[1]
     tolerance = INCIDENCE_TOLERANCE * h
-    count = np.zeros(len(x), int)
-    normal = np.zeros_like(x)
-    first = np.zeros_like(x)                 # normal of the first incident piece
-    min_dot = np.ones(len(x))                # smallest cosine between an incident normal and the first one
+    count = jnp.zeros(x.shape[0], int)
+    normal = jnp.zeros_like(x)
+    first = jnp.zeros_like(x)                 # normal of the first incident piece
+    min_dot = jnp.ones(x.shape[0])            # smallest cosine between an incident normal and the first one
     for points, normals in dense:
-        if not points.size:
+        if points is None or not points.size:
             continue
-        dist, idx = cKDTree(points).query(x)
+        # Nearest loop point, exact within the tolerance (beyond it only "not incident" matters).
+        dist, idx = nearest_within_sparse(x, points, tolerance)
         on = dist <= tolerance
+        nb = normals[jnp.where(on, idx, 0)]
         fresh = on & (count == 0)
-        first[fresh] = normals[idx[fresh]]
+        first = jnp.where(fresh[:, None], nb, first)
         later = on & ~fresh
-        min_dot[later] = np.minimum(min_dot[later], np.sum(normals[idx[later]] * first[later], axis=1))
-        count += on
-        normal[on] += normals[idx[on]]
+        min_dot = jnp.where(later, jnp.minimum(min_dot, _dot_rows(nb, first)), min_dot)
+        count = count + on
+        normal = jnp.where(on[:, None], normal + nb, normal)
     smooth = min_dot >= np.cos(np.radians(smooth_seam_degrees))
     keep = (count >= 2) & ~smooth
-    x, normal, count = x[keep], normal[keep], count[keep]
-    norm = np.linalg.norm(normal, axis=1)
-    if np.any(norm < 1e-8):
+    x, normal, count = compact_rows(keep, x, normal, count)
+    norm = row_norm(normal)
+    if bool(jnp.any(norm < 1e-8)):
         raise ValueError("feature normals cancel; incident pieces have opposite normals")
-    priority = np.minimum(count - 1, d - 1).astype(int)
+    priority = jnp.minimum(count - 1, d - 1).astype(int)
     return x, normal / norm[:, None], priority

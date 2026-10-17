@@ -204,37 +204,74 @@ def _grouped_frame(parameters,width,sites,weights,poly,origins,centers,widths,of
     return jacobian,normal/jnp.linalg.norm(normal,axis=1)[:,None]
 
 
+@jit
+def _width_order(counts):
+    """Power-of-two width exponent per point, a stable sort by it, and the exponent histogram."""
+    e=32-lax.clz(jnp.maximum(counts,1).astype(jnp.int32)-1)
+    return jnp.argsort(e,stable=True),jnp.zeros(33,jnp.int32).at[e].add(1)
+
+
+@partial(jit,static_argnums=(3,))
+def _group_ids(order,start,count,size):
+    pos=jnp.arange(size)
+    return jnp.where(pos<count,order[jnp.minimum(start+pos,order.shape[0]-1)],order.shape[0])
+
+
+def device_groups(counts):
+    """Yield (width, count, ids) per power-of-two overlap width, ascending.
+
+    ids hold that group's point indices in ascending order, padded to bucket(count)
+    with n (out of range). Only the 33-entry width histogram reaches the host."""
+    from kernelpack.accelerators.jax_spatial import bucket
+    order,hist=_width_order(counts); start=0
+    for e,count in enumerate(np.asarray(hist).tolist()):
+        if not count: continue
+        yield 1<<e,count,_group_ids(order,start,count,bucket(count))
+        start+=count
+
+
+@jit
+def take_rows(x,ids):
+    """x[ids] with zero rows for out-of-range ids (the padding of device_groups)."""
+    return jnp.take(x,ids,axis=0,mode='fill',fill_value=0)
+
+
+@jit
+def put_rows(out,ids,values):
+    return out.at[ids].set(values[:len(ids)].astype(out.dtype),mode='drop')
+
+
+@partial(jit,static_argnums=(1,))
+def pad_device(x,n,value=0.):
+    return jnp.concatenate((x,jnp.full((n-x.shape[0],)+x.shape[1:],value,x.dtype)))
+
+
 def _grouped_parametric(model,parameters,frame=False):
-    """Bin parameter points by overlap count; one fixed-shape kernel per bin.
+    """Bin parameter points by overlap count; one fixed-shape kernel per bin, on device.
 
     The top-w weights of a bin contain every nonzero weight, so results equal
     the global ``max_active`` evaluation (dropped weights are exact zeros).
     """
-    from kernelpack.accelerators.jax_spatial import bucket,pad_rows
-    params=np.asarray(parameters,float)
+    from kernelpack.accelerators.jax_spatial import bucket
+    params=jnp.asarray(parameters,dtype=float)
     n=len(params); dim_out=int(model.origins.shape[-1])
     if n==0:
         return (jnp.zeros((0,dim_out,params.shape[1])),jnp.zeros((0,dim_out))) if frame else jnp.zeros((0,dim_out))
     count=int(model.centers.shape[0])
     n_pad=bucket(n); chunk=min(n_pad,max(64,(1<<22)//max(1,count)))
     chunk=1<<int(np.floor(np.log2(chunk)))
-    counts=np.asarray(_rect_overlap_counts(jnp.asarray(pad_rows(params,n_pad,0.)),model.centers,model.widths,
-        model.offset,model.scale,chunk))[:n]
-    widths=(1<<np.ceil(np.log2(np.maximum(counts,1))).astype(np.int64))
+    counts=_rect_overlap_counts(pad_device(params,n_pad),model.centers,model.widths,model.offset,model.scale,chunk)[:n]
     args=(model.sites,model.weights,model.poly_coeffs,model.origins,model.centers,model.widths,model.offset,model.scale)
-    if frame:
-        jac=np.empty((n,dim_out,params.shape[1])); nr=np.empty((n,dim_out))
-    else:
-        out=np.empty((n,dim_out))
-    for w in np.unique(widths):
-        ids=np.flatnonzero(widths==w); w=int(min(w,count))
-        sub=jnp.asarray(pad_rows(params[ids],bucket(len(ids)),0.))
+    if frame: jac=jnp.zeros((n,dim_out,params.shape[1])); nr=jnp.zeros((n,dim_out))
+    else: out=jnp.zeros((n,dim_out))
+    for w,_,ids in device_groups(counts):
+        w=int(min(w,count)); sub=take_rows(params,ids)
         batch=_point_batch(sub.shape[0],w,int(model.sites.shape[1]))
         if frame:
-            j,v=_grouped_frame(sub,w,*args,max(1,batch//4)); jac[ids]=np.asarray(j)[:len(ids)]; nr[ids]=np.asarray(v)[:len(ids)]
+            j,v=_grouped_frame(sub,w,*args,max(1,batch//4)); jac=put_rows(jac,ids,j); nr=put_rows(nr,ids,v)
         else:
-            out[ids]=np.asarray(_grouped_evaluate(sub,w,*args,batch))[:len(ids)]
-    return (jnp.asarray(jac),jnp.asarray(nr)) if frame else jnp.asarray(out)
+            out=put_rows(out,ids,_grouped_evaluate(sub,w,*args,batch))
+    return (jac,nr) if frame else out
 
 
 def _max_overlap(centers,widths):
@@ -300,6 +337,26 @@ def _affine_ranks(local,valid):
     return jnp.sum(jnp.linalg.svd(p,compute_uv=False)>1e-10,axis=1)
 
 
+@jit
+def _usable_data(local,valid,ids,positions,usable):
+    sites=local[usable]; active=valid[usable]; members=ids[usable]
+    return sites,active,jnp.where(active[:,:,None],positions[jnp.maximum(members,0)],0.)
+
+
+@partial(jit,static_argnums=(5,))
+def _bucket_data(sites,values,active,g,m,size):
+    """Rows g (padded with an out-of-range index) of one size bucket; padded supports get one zero site."""
+    rows=jnp.arange(g.shape[0])
+    return (take_rows(sites,g)[:,:size],take_rows(values,g)[:,:size],
+        take_rows(active,g)[:,:size]|(rows[:,None]>=m)&(jnp.arange(size)[None,:]==0))
+
+
+@jit
+def _put_fits(weights,poly,origins,g,w,pc,o):
+    size=w.shape[1]
+    return weights.at[g,:size].set(w,mode='drop'),poly.at[g].set(pc,mode='drop'),origins.at[g].set(o,mode='drop')
+
+
 def _build(parameters,positions,cells,offset,scale,options):
     """Device memberships and batched local fits, grouped by support size."""
     from kernelpack.accelerators.jax_spatial import bucket,pad_rows
@@ -323,26 +380,23 @@ def _build(parameters,positions,cells,offset,scale,options):
     usable=np.flatnonzero(nonempty)
     centers=centers[usable]; widths=widths[usable]; cells=[cells[i] for i in usable]
     counts=counts[usable]
-    sites=np.asarray(local)[usable]; active=np.asarray(valid)[usable]
-    members=np.asarray(ids)[usable]
-    values=np.where(active[:,:,None],np.asarray(positions)[np.maximum(members,0)],0.)
+    u=jnp.asarray(usable)
+    sites,active,values=_usable_data(local,valid,ids,jnp.asarray(positions,dtype=float),u)
     # Bucket supports by their own power-of-two size; one batched solve per bucket,
     # chunked only by a device-memory budget.
-    weights=np.zeros(sites.shape[:2]+(positions.shape[1],)); poly=np.zeros((len(cells),sites.shape[2]+1,positions.shape[1]))
-    origins=np.zeros((len(cells),positions.shape[1]))
+    weights=jnp.zeros(sites.shape[:2]+(positions.shape[1],)); poly=jnp.zeros((len(cells),sites.shape[2]+1,positions.shape[1]))
+    origins=jnp.zeros((len(cells),positions.shape[1]))
     sizes=np.array([bucket(c,8) for c in counts])
     for size in np.unique(sizes):
         group=np.flatnonzero(sizes==size)
         per=(int(size)+sites.shape[2]+1)**2*8*4
         batch=bucket(max(1,min(len(group),(1<<31)//per)),1)
         for start in range(0,len(group),batch):
-            g=group[start:start+batch]; m=len(g)
-            w,pc,o=_solve_local_fits(jnp.asarray(pad_rows(sites[g,:size],batch,0.)),
-                jnp.asarray(pad_rows(values[g,:size],batch,0.)),
-                jnp.asarray(pad_rows(active[g,:size],batch,False)|(np.arange(batch)[:,None]>=m)&(np.arange(size)[None,:]==0)))
-            weights[g,:size]=np.asarray(w)[:m]; poly[g]=np.asarray(pc)[:m]; origins[g]=np.asarray(o)[:m]
-    if not np.all(np.isfinite(weights)): raise ValueError('nonfinite PU geometry fit')
-    model=ParametricPUModel(jnp.asarray(sites),jnp.asarray(weights),jnp.asarray(poly),jnp.asarray(origins),jnp.asarray(centers),
+            g=group[start:start+batch]; gi=jnp.asarray(pad_rows(g,batch,len(cells)))
+            w,pc,o=_solve_local_fits(*_bucket_data(sites,values,active,gi,len(g),int(size)))
+            weights,poly,origins=_put_fits(weights,poly,origins,gi,w,pc,o)
+    if not bool(jnp.all(jnp.isfinite(weights))): raise ValueError('nonfinite PU geometry fit')
+    model=ParametricPUModel(sites,weights,poly,origins,jnp.asarray(centers),
         jnp.asarray(widths),jnp.asarray(offset),jnp.asarray(scale),len(cells),cells)
     model.diagnostics=dict(patch_count=len(cells),support_counts=counts.tolist(),
         padded_capacity=capacity,max_active=model.max_active,kernel='r^3 + Pi_1',

@@ -72,7 +72,7 @@ def save_domain(domain,path,geometry,h,seed):
 
 
 def rd_final(base,family,theta,steps):
-    wrapper=StatelessReactionDiffusionSolver.from_solver(base)
+    wrapper=StatelessReactionDiffusionSolver.from_solver(base,prepare_orders=(3,))   # the rollout is BDF3 only
     forcing=rd.make_forcing(family,base.nu,theta)
     reaction=rd.build_reaction_term(family,theta)
     bc=lambda _a,_b,nr,t,x:normal_derivative(lambda z:rd.exact_state(t,z),x,nr)      # Neumann: du/dn = g

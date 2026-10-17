@@ -1683,56 +1683,55 @@ class PiecewiseSmoothEmbeddedSurface:
     def _assemble_boundary(self, radius: float, smooth_normals: bool, smooth_neighborhood: int, use_uniform: bool = False) -> None:
         self.sep_rad=float(radius)
         self.assembly_options=dict(smooth_normals=smooth_normals,smooth_neighborhood=smooth_neighborhood,use_uniform=use_uniform)
-        # Host bookkeeping (concatenation, flags) is plain numpy: per-segment
-        # eager device ops compile once per distinct shape. Thinning is on device.
+        # Sites, normals, ordering and thinning stay on the device; the host only sees
+        # per-piece counts (static shapes) and the validity checks' booleans.
+        from kernelpack.accelerators.jax_spatial import compact_rows, row_norm
         def gather(sites_of, normals_of):
-            xb = np.vstack([np.asarray(sites_of(seg), dtype=float) for seg in self.segments])
-            nr = np.vstack([np.asarray(normals_of(seg), dtype=float) for seg in self.segments])
-            seg_map = np.concatenate([np.full(len(np.asarray(sites_of(seg))), k, dtype=int) for k, seg in enumerate(self.segments)])
+            sites = [jnp.asarray(sites_of(seg), dtype=float) for seg in self.segments]
+            xb = jnp.concatenate(sites)
+            nr = jnp.concatenate([jnp.asarray(normals_of(seg), dtype=float) for seg in self.segments])
+            seg_map = np.repeat(np.arange(len(sites)), [x.shape[0] for x in sites])
             # Samples on the pieces have priority 0; features come first (below).
-            return xb, nr, seg_map, np.zeros(len(xb), dtype=float)
+            return xb, nr, seg_map, jnp.zeros(xb.shape[0], dtype=float)
 
         xb, nr, segment_map, corner = gather(lambda s: s.get_sample_sites(), lambda s: s.get_nrmls())
         if self.feature_sites.shape[0]:
-            features = np.asarray(self.feature_sites, dtype=float)
-            normals = np.asarray(self.feature_normals, dtype=float)
-            priorities = np.asarray(self.feature_priorities, dtype=int)
+            features = jnp.asarray(self.feature_sites, dtype=float)
+            normals = jnp.asarray(self.feature_normals, dtype=float)
+            priorities = jnp.asarray(self.feature_priorities, dtype=int)
         else:
             # Features derived from the mapped trimming loops (geometry/features.py).
             from .features import derive_features
             features, normals, priorities = derive_features(self.segments, radius)
         self.derived_features = (features, normals, priorities)
-        if len(features):
-            if features.shape != normals.shape or priorities.shape != (features.shape[0],):
+        n_features = int(features.shape[0])
+        if n_features:
+            if features.shape != normals.shape or priorities.shape != (n_features,):
                 raise ValueError("feature sites, normals and priorities must have matching shapes")
-            if (features.shape[1] != xb.shape[1] or not np.all(np.isfinite(normals))
-                    or not np.all(np.isfinite(features)) or np.any(priorities <= 0)):
+            if (features.shape[1] != xb.shape[1] or not bool(jnp.all(jnp.isfinite(normals)))
+                    or not bool(jnp.all(jnp.isfinite(features))) or bool(jnp.any(priorities <= 0))):
                 raise ValueError("features need matching dimensions, finite coordinates/normals and positive priorities")
-            if np.any(np.linalg.norm(normals, axis=1) == 0):
+            if bool(jnp.any(row_norm(normals) == 0)):
                 raise ValueError("feature normals must be nonzero")
             # Larger feature priorities precede smaller ones, before face points (0).
             # This also makes duplicate elimination respect feature priority.
-            order = np.argsort(-priorities, kind="stable")
-            feature_normals = normals[order] / np.linalg.norm(normals[order], axis=1)[:, None]
-            xb = np.vstack([features[order], xb])
-            nr = np.vstack([feature_normals, nr])
-            segment_map = np.concatenate([np.full(len(features), -1, dtype=int), segment_map])
-            corner = np.concatenate([priorities[order].astype(float), corner])
-        keep = np.asarray(_assembled_boundary_keep_mask(xb, corner, float(radius)))
-        self.xb = jnp.asarray(xb[keep])
-        self.nrmls = jnp.asarray(nr[keep])
-        self.segment_map = jnp.asarray(segment_map[keep])
-        self.corner_flags = jnp.asarray(corner[keep])
+            order = jnp.argsort(-priorities, stable=True)
+            feature_normals = normals[order] / row_norm(normals[order])[:, None]
+            xb = jnp.concatenate([features[order], xb])
+            nr = jnp.concatenate([feature_normals, nr])
+            segment_map = np.concatenate([np.full(n_features, -1, dtype=int), segment_map])
+            corner = jnp.concatenate([priorities[order].astype(float), corner])
+        keep = _assembled_boundary_keep_mask(xb, corner, float(radius))
+        self.xb, self.nrmls, self.corner_flags = compact_rows(keep, xb, nr, corner)
+        self.segment_map = compact_rows(keep, jnp.asarray(segment_map))
         if use_uniform:
             xb_uniform, nr_uniform, _, uniform_corner = gather(lambda s: s.get_uniform_sample_sites(), lambda s: s.get_uniform_nrmls())
-            if len(features):
-                xb_uniform = np.vstack([features[order], xb_uniform])
-                nr_uniform = np.vstack([feature_normals, nr_uniform])
-                uniform_corner = np.concatenate([priorities[order].astype(float), uniform_corner])
-            keep_uniform = np.asarray(_assembled_boundary_keep_mask(xb_uniform, uniform_corner, float(radius)))
-            self.xb_uniform = jnp.asarray(xb_uniform[keep_uniform])
-            self.nrmls_uniform = jnp.asarray(nr_uniform[keep_uniform])
-            uniform_corner = jnp.asarray(uniform_corner)
+            if n_features:
+                xb_uniform = jnp.concatenate([features[order], xb_uniform])
+                nr_uniform = jnp.concatenate([feature_normals, nr_uniform])
+                uniform_corner = jnp.concatenate([priorities[order].astype(float), uniform_corner])
+            keep_uniform = _assembled_boundary_keep_mask(xb_uniform, uniform_corner, float(radius))
+            self.xb_uniform, self.nrmls_uniform = compact_rows(keep_uniform, xb_uniform, nr_uniform)
         else:
             self.xb_uniform = self.xb
             self.nrmls_uniform = self.nrmls
@@ -1741,7 +1740,7 @@ class PiecewiseSmoothEmbeddedSurface:
             self.nrmls = jnp.where((self.corner_flags > 0)[:, None], self.nrmls, smoothed)
             if use_uniform:
                 uniform_smoothed = self._smooth_normals(self.xb_uniform, self.nrmls_uniform, smooth_neighborhood)
-                self.nrmls_uniform = jnp.where((uniform_corner[keep_uniform] > 0)[:, None],
+                self.nrmls_uniform = jnp.where((compact_rows(keep_uniform, uniform_corner) > 0)[:, None],
                                                self.nrmls_uniform, uniform_smoothed)
             else:
                 self.nrmls_uniform = self.nrmls
@@ -1856,23 +1855,28 @@ def _assembled_boundary_keep_mask(x: jnp.ndarray, corner_flags: jnp.ndarray, rad
     graph ``|x_i - x_j| < radius*(1-1e-12)`` in parallel rounds on the device;
     identical to the sequential pass in ``_assembled_boundary_keep_mask_impl``.
     """
-    from kernelpack.accelerators.jax_spatial import bucket, conflict_lists, greedy_independent_set, pad_rows
-    pts = np.asarray(x, dtype=float)
-    corners = np.asarray(corner_flags, dtype=float).reshape(-1)
+    from kernelpack.accelerators.jax_spatial import bucket, conflict_lists, greedy_independent_set, pad_rows_device
+    pts = jnp.asarray(x, dtype=float)
     n = pts.shape[0]
     if n == 0:
         return jnp.zeros(0, dtype=bool)
     if radius <= 0:
         return jnp.ones(n, dtype=bool)
-    order = np.argsort(-corners, kind="stable")
     n_pad = bucket(n)
-    rank = np.arange(n_pad, dtype=np.int64)
-    rank[order] = np.arange(n)
-    valid = pad_rows(np.ones(n, bool), n_pad, False)
-    neighbors = conflict_lists(pad_rows(pts, n_pad, 0.0), pad_rows(np.full(n, float(radius)), n_pad, 0.0), valid,
+    corners = pad_rows_device(jnp.asarray(corner_flags, dtype=float).reshape(-1), n_pad, -jnp.inf)
+    valid, rank = _keep_mask_rank(corners, n)
+    neighbors = conflict_lists(pad_rows_device(pts, n_pad, 0.0), jnp.where(valid, float(radius), 0.0), valid,
                                scale=1.0 - 1.0e-12)
     keep, _ = greedy_independent_set(neighbors, rank, excluded=~valid)
-    return jnp.asarray(np.asarray(keep)[:n])
+    return keep[:n]
+
+
+@jit
+def _keep_mask_rank(corners, n):
+    """Rank = position in the stable order of decreasing corner flag; padding (-inf) keeps its index."""
+    rows = jnp.arange(corners.shape[0])
+    order = jnp.argsort(-corners, stable=True)
+    return rows < n, jnp.zeros(corners.shape[0], jnp.int32).at[order].set(rows.astype(jnp.int32))
 
 
 def _assembled_boundary_keep_mask_warp(x: jnp.ndarray, corner_flags: jnp.ndarray, radius: float) -> jnp.ndarray:

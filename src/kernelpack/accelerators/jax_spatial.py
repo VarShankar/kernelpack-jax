@@ -1,8 +1,9 @@
 """Fixed-shape GPU spatial primitives in JAX.
 
 Every jitted kernel sees power-of-two padded shapes, so it compiles once per
-size bucket rather than once per call. Inputs are padded on the host (cheap)
-and all O(N) and O(N * neighbours) work runs on the device.
+size bucket rather than once per call. Data stay on the device; the host sees
+only scalars that fix static shapes (counts, bounding boxes, bucket sizes) and
+the seeded host RNG draws, which are uploaded once.
 
 Primitives
 ----------
@@ -57,6 +58,55 @@ def pad_rows(x, n: int, value=0) -> np.ndarray:
         return x
     pad = np.full((n - x.shape[0],) + x.shape[1:], value, dtype=x.dtype)
     return np.concatenate([x, pad])
+
+
+def pad_rows_device(x, n: int, value=0):
+    """Pad a device array along axis 0 to ``n`` rows."""
+    x = jnp.asarray(x)
+    if x.shape[0] > n:
+        raise ValueError("cannot pad to fewer rows")
+    if x.shape[0] == n:
+        return x
+    return jnp.concatenate([x, jnp.full((n - x.shape[0],) + x.shape[1:], value, dtype=x.dtype)])
+
+
+def compact_rows(mask, *arrays):
+    """Rows of each array where ``mask`` holds, in order (one scalar sync for the count)."""
+    mask = jnp.asarray(mask, bool)
+    idx = jnp.nonzero(mask, size=int(jnp.sum(mask)))[0]
+    out = tuple(jnp.asarray(a)[idx] for a in arrays)
+    return out[0] if len(out) == 1 else out
+
+
+@jit
+def ordered_sq_norm(d):
+    """Row sums of squares ((d_0^2 + d_1^2) + d_2^2) + ..., in coordinate order and without
+    multiply-add contraction: bit-identical to numpy's ``np.sum(d**2, axis=1)`` for d <= 8 columns."""
+    sq = lax.optimization_barrier(d * d)
+    s = sq[..., 0]
+    for k in range(1, d.shape[-1]):
+        s = s + sq[..., k]
+    return s
+
+
+def row_norm(x):
+    """``np.linalg.norm(x, axis=1)`` on the device, bit for bit."""
+    return jnp.sqrt(ordered_sq_norm(jnp.asarray(x)))
+
+
+@jit
+def _masked_box(points, valid):
+    big = jnp.asarray(jnp.inf, points.dtype)
+    return (jnp.min(jnp.where(valid[:, None], points, big), axis=0),
+            jnp.max(jnp.where(valid[:, None], points, -big), axis=0), jnp.any(valid))
+
+
+def masked_box(points, valid=None):
+    """Host (lo, hi, any_valid) of the valid rows: one small transfer."""
+    points = jnp.asarray(points)
+    valid = jnp.ones(points.shape[0], bool) if valid is None else jnp.asarray(valid, bool)
+    lo, hi, anyv = jax.device_get(_masked_box(points, valid))
+    return np.asarray(lo, float), np.asarray(hi, float), bool(anyv)
 
 
 def _offsets(dim: int) -> np.ndarray:
@@ -122,11 +172,11 @@ def _cell_table(points, valid, lo, cell, dims, n_cells_pad, capacity):
     return table[:n_cells_pad]
 
 
-def build_cell_table(grid: CellGrid, points: np.ndarray, valid: np.ndarray):
-    """Device cell table for padded ``points``; capacity is bucketed."""
+def build_cell_table(grid: CellGrid, points, valid):
+    """Device cell table for padded ``points`` (host or device); capacity is bucketed."""
     args = grid.device_args()
-    pts = jnp.asarray(points)
-    val = jnp.asarray(valid)
+    pts = jnp.asarray(points, float)
+    val = jnp.asarray(valid, bool)
     counts = _cell_counts(pts, val, *args, grid.n_cells_pad)
     capacity = bucket(int(jnp.max(counts)), 16)
     return _cell_table(pts, val, *args, grid.n_cells_pad, capacity)
@@ -188,30 +238,29 @@ def _chunk_for(n_pad: int, ring: int, capacity_hint: int = 32) -> int:
     return int(min(n_pad, 2048))
 
 
-def conflict_lists(points: np.ndarray, radii: np.ndarray, valid: np.ndarray, *, scale: float = 1.0):
+def conflict_lists(points, radii, valid, *, scale: float = 1.0):
     """Padded neighbour lists of the symmetric conflict graph.
 
-    ``points``/``radii``/``valid`` must already be padded to a power of two.
+    ``points``/``radii``/``valid`` (host or device) must already be padded to a power of two.
     Two valid points conflict iff ``|x - y| < scale * max(r_x, r_y)``.
     Returns a device int32 array ``(n_pad, width)`` with -1 padding.
     """
-    points = np.asarray(points, float)
-    radii = np.asarray(radii, float)
-    valid = np.asarray(valid, bool)
-    n_pad = points.shape[0]
-    rmax = float(np.max(radii[valid])) * float(scale) if valid.any() else 1.0
-    lo = points[valid].min(axis=0) if valid.any() else np.zeros(points.shape[1])
-    hi = points[valid].max(axis=0) if valid.any() else np.ones(points.shape[1])
+    pts = jnp.asarray(points, float)
+    rad = jnp.asarray(radii, float)
+    val = jnp.asarray(valid, bool)
+    n_pad = pts.shape[0]
+    lo, hi, any_valid = masked_box(pts, val)
+    rmax = float(jnp.max(jnp.where(val, rad, -jnp.inf))) * float(scale) if any_valid else 1.0
+    if not any_valid:
+        lo, hi = np.zeros(pts.shape[1]), np.ones(pts.shape[1])
     grid = CellGrid(lo, hi, max(rmax, 1e-300))
-    table = build_cell_table(grid, np.where(valid[:, None], points, lo), valid)
+    table = build_cell_table(grid, jnp.where(val[:, None], pts, jnp.asarray(lo)), val)
     offsets = jnp.asarray(grid.offsets)
     lcd = grid.device_args()
-    pts, rad, val = jnp.asarray(points), jnp.asarray(radii), jnp.asarray(valid)
     ids = jnp.arange(n_pad, dtype=jnp.int32)
     chunk = _chunk_for(n_pad, len(grid.offsets), table.shape[1])
     counts = _conflict_counts(pts, rad, ids, pts, rad, val, table, offsets, lcd, float(scale), chunk)
-    counts = jnp.where(val, counts, 0)
-    width = bucket(int(jnp.max(counts)), 32)
+    width = bucket(int(jnp.max(jnp.where(val, counts, 0))), 32)
     return _conflict_lists(pts, rad, ids, pts, rad, val, table, offsets, lcd, float(scale), chunk, width)
 
 
@@ -255,16 +304,20 @@ def greedy_independent_set(neighbors, rank, *, fixed=None, excluded=None):
     return state == _IN, int(rounds)
 
 
-@partial(jit, static_argnums=(7,))
-def _nearest_within(queries, points, valid, table, offsets, lo_cell_dims, radius, chunk):
+@partial(jit, static_argnums=(7, 8))
+def _nearest_within(queries, points, valid, table, offsets, lo_cell_dims, radius, chunk, ordered):
     lo, cell, dims = lo_cell_dims
 
     def one(q):
         ids = _ring_candidates(q, table, offsets, lo, cell, dims)
         ok = ids >= 0
         safe = jnp.where(ok, ids, 0)
-        d2 = jnp.where(ok & valid[safe], jnp.sum((points[safe] - q) ** 2, axis=1), jnp.inf)
-        j = jnp.argmin(d2)
+        diff = points[safe] - q
+        d2 = jnp.where(ok & valid[safe], ordered_sq_norm(diff) if ordered else jnp.sum(diff ** 2, axis=1), jnp.inf)
+        if ordered:     # ties: lowest point index
+            j = jnp.argmin(jnp.where(d2 == jnp.min(d2), safe, jnp.iinfo(jnp.int32).max))
+        else:
+            j = jnp.argmin(d2)
         d = jnp.sqrt(d2[j])
         return jnp.where(d <= radius, d, jnp.inf), jnp.where(d <= radius, safe[j], -1)
 
@@ -273,26 +326,96 @@ def _nearest_within(queries, points, valid, table, offsets, lo_cell_dims, radius
     return d.reshape(-1), i.reshape(-1)
 
 
-def nearest_within(queries: np.ndarray, points: np.ndarray, radius: float):
-    """Distance and index of the nearest point, exact when <= ``radius`` (else inf, -1)."""
-    q = np.asarray(queries, float)
-    p = np.asarray(points, float)
+def nearest_within(queries, points, radius: float, *, ordered: bool = False):
+    """Distance and index of the nearest point, exact when <= ``radius`` (else inf, -1).
+
+    Host or device inputs; device outputs. ``ordered``: distances are computed as
+    ``sqrt(sum_k (x_k - y_k)^2)`` in coordinate order without contraction (bit-identical to
+    numpy/scipy) and ties go to the lowest point index.
+    """
+    q = jnp.asarray(queries, float)
+    p = jnp.asarray(points, float)
     nq, npnt = q.shape[0], p.shape[0]
     if nq == 0:
-        return np.zeros(0), np.zeros(0, np.int64)
+        return jnp.zeros(0), jnp.zeros(0, jnp.int32)
     if npnt == 0:
-        return np.full(nq, np.inf), np.full(nq, -1)
-    qp = pad_rows(q, bucket(nq), 0.0)
-    pp = pad_rows(p, bucket(npnt), 0.0)
-    valid = pad_rows(np.ones(npnt, bool), pp.shape[0], False)
-    lo = np.minimum(q.min(axis=0), p.min(axis=0))
-    hi = np.maximum(q.max(axis=0), p.max(axis=0))
-    grid = CellGrid(lo, hi, max(float(radius), 1e-300))
-    table = build_cell_table(grid, np.where(valid[:, None], pp, p[0]), valid)
+        return jnp.full(nq, jnp.inf), jnp.full(nq, -1, jnp.int32)
+    qp = pad_rows_device(q, bucket(nq), 0.0)
+    pp = pad_rows_device(p, bucket(npnt), 0.0)
+    valid = jnp.arange(pp.shape[0]) < npnt
+    qlo, qhi, _ = masked_box(qp, jnp.arange(qp.shape[0]) < nq)
+    plo, phi, _ = masked_box(pp, valid)
+    grid = CellGrid(np.minimum(qlo, plo), np.maximum(qhi, phi), max(float(radius), 1e-300))
+    table = build_cell_table(grid, jnp.where(valid[:, None], pp, p[0]), valid)
     chunk = _chunk_for(qp.shape[0], len(grid.offsets), table.shape[1])
-    d, i = _nearest_within(jnp.asarray(qp), jnp.asarray(pp), jnp.asarray(valid), table,
-                           jnp.asarray(grid.offsets), grid.device_args(), float(radius), chunk)
-    return np.asarray(d)[:nq], np.asarray(i)[:nq]
+    d, i = _nearest_within(qp, pp, valid, table, jnp.asarray(grid.offsets), grid.device_args(), float(radius),
+                           chunk, bool(ordered))
+    return d[:nq], i[:nq]
+
+
+@partial(jit, static_argnums=(9, 10))
+def _sorted_nearest(queries, points, skeys, order, offsets, lo, cell, dims, radius, cap, chunk):
+    n = skeys.shape[0]
+    big = jnp.iinfo(jnp.int32).max
+
+    def one(q):
+        c = jnp.clip(jnp.floor((q - lo) / cell).astype(skeys.dtype), 0, dims - 1)
+        nb = c[None, :] + offsets
+        inside = jnp.all((nb >= 0) & (nb < dims), axis=1)
+        keys = _flatten(jnp.clip(nb, 0, dims - 1), dims)
+        j = jnp.searchsorted(skeys, keys, side="left")[:, None] + jnp.arange(cap)
+        jj = jnp.clip(j, 0, n - 1)
+        hit = (inside[:, None] & (j < n) & (skeys[jj] == keys[:, None])).reshape(-1)
+        ids = order[jj].reshape(-1)
+        d2 = jnp.where(hit, ordered_sq_norm(points[ids] - q), jnp.inf)
+        k = jnp.argmin(jnp.where(d2 == jnp.min(d2), ids, big))      # ties: lowest point index
+        d = jnp.sqrt(d2[k])
+        return jnp.where(d <= radius, d, jnp.inf), jnp.where(d <= radius, ids[k], -1)
+
+    d, i = lax.map(lambda b: jax.vmap(one)(b), queries.reshape(-1, chunk, queries.shape[1]))
+    return d.reshape(-1), i.reshape(-1)
+
+
+@jit
+def _sorted_keys(points, valid, lo, cell, dims):
+    c = jnp.clip(jnp.floor((points - lo) / cell).astype(dims.dtype), 0, dims - 1)
+    keys = jnp.where(valid, _flatten(c, dims), jnp.iinfo(dims.dtype).max)
+    order = jnp.argsort(keys, stable=True)
+    skeys = keys[order]
+    first = jnp.searchsorted(skeys, skeys, side="left")
+    run = jnp.where(skeys < jnp.iinfo(dims.dtype).max, jnp.arange(skeys.shape[0]) - first + 1, 0)
+    return skeys, order.astype(jnp.int32), jnp.max(run)
+
+
+def nearest_within_sparse(queries, points, radius: float):
+    """``nearest_within(..., ordered=True)`` for small radii: cells of width ``radius`` addressed by
+    sorted cell keys (memory O(N), not O(number of cells)). Device outputs; ties go to the lowest index."""
+    q = jnp.asarray(queries, float)
+    p = jnp.asarray(points, float)
+    nq, npnt = q.shape[0], p.shape[0]
+    if nq == 0:
+        return jnp.zeros(0), jnp.zeros(0, jnp.int32)
+    if npnt == 0:
+        return jnp.full(nq, jnp.inf), jnp.full(nq, -1, jnp.int32)
+    if not jax.config.jax_enable_x64:
+        raise ValueError("nearest_within_sparse needs jax_enable_x64 (int64 cell keys)")
+    qp = pad_rows_device(q, bucket(nq), 0.0)
+    pp = pad_rows_device(p, bucket(npnt), 0.0)
+    valid = jnp.arange(pp.shape[0]) < npnt
+    qlo, qhi, _ = masked_box(qp, jnp.arange(qp.shape[0]) < nq)
+    plo, phi, _ = masked_box(pp, valid)
+    lo, hi = np.minimum(qlo, plo), np.maximum(qhi, phi)
+    cell = max(float(radius), 1e-300)
+    lo = lo - 1e-9 * max(1.0, float(np.max(np.abs(hi - lo))))
+    dims = np.maximum(1, np.ceil((hi - lo) / cell).astype(np.int64) + 1)
+    if float(np.prod(dims.astype(float))) > 2.0**62:
+        raise ValueError("cell keys overflow; increase the radius")
+    dims_d = jnp.asarray(dims, jnp.int64)
+    lo_d, cell_d = jnp.asarray(lo), jnp.asarray(cell)
+    skeys, order, run = _sorted_keys(pp, valid, lo_d, cell_d, dims_d)
+    cap = bucket(int(run), 4)
+    return tuple(a[:nq] for a in _sorted_nearest(qp, pp, skeys, order, jnp.asarray(_offsets(q.shape[1]), jnp.int64),
+                                                 lo_d, cell_d, dims_d, float(radius), cap, _chunk_for(qp.shape[0], 0)))
 
 
 @partial(jit, static_argnums=(8, 9))
@@ -405,32 +528,75 @@ def _uniform(key, n, dim, lo, hi):
     return lo + jax.random.uniform(key, (n, dim), dtype=jnp.float64) * (hi - lo)
 
 
+@jit
+def _compact_first(cand, ok):
+    """Accepted rows first (input order); the remaining rows repeat the first accepted row,
+    so the padded array has the same bounding box as the accepted rows."""
+    idx = jnp.argsort(~ok, stable=True)
+    n = jnp.sum(ok)
+    rows = jnp.arange(cand.shape[0])
+    return cand[jnp.where(rows < n, idx, idx[0])]
+
+
+@partial(jit, static_argnums=(7,))
+def _pass_layout(prior, prior_r, n_prior, cand, cand_r, n_cand, perm, n_pad):
+    """[prior rows, candidate rows, zero padding] and the dart-throwing ranks: prior rows keep their
+    index, candidate j gets n_prior + perm[j], padding keeps its index."""
+    rows = jnp.arange(n_pad)
+    ip = jnp.clip(rows, 0, prior.shape[0] - 1)
+    ic = jnp.clip(rows - n_prior, 0, cand.shape[0] - 1)
+    in_p = rows < n_prior
+    in_c = (rows >= n_prior) & (rows < n_prior + n_cand)
+    pts = jnp.where(in_p[:, None], prior[ip], jnp.where(in_c[:, None], cand[ic], 0.0))
+    rad = jnp.where(in_p, prior_r[ip], jnp.where(in_c, cand_r[ic], 0.0))
+    rank = jnp.where(in_c, n_prior + perm[ic], rows)
+    return pts, rad, in_p | in_c, in_p, rank
+
+
+@jit
+def _pass_accept(pts, rad, in_set, rank, n_prior, n):
+    """Prior rows followed by the selected candidates in rank order (zero padded), and their count."""
+    rows = jnp.arange(pts.shape[0])
+    take = (rows >= n_prior) & (rows < n) & in_set
+    order = jnp.argsort(jnp.where(take, rank, jnp.iinfo(rank.dtype).max), stable=True)
+    n_take = jnp.sum(take)
+    src = jnp.where(rows < n_prior, rows, order[jnp.clip(rows - n_prior, 0, pts.shape[0] - 1)])
+    keep = rows < n_prior + n_take
+    return jnp.where(keep[:, None], pts[src], 0.0), jnp.where(keep, rad[src], 0.0), n_take
+
+
 def poisson_disk_sample(
     lo,
     hi,
-    radius_of: Callable[[np.ndarray], np.ndarray],
+    radius_of: Callable,
     min_radius: float,
     *,
     seed: int = 0,
-    accept: Callable[[np.ndarray], np.ndarray] | None = None,
-    fixed_points: np.ndarray | None = None,
-    fixed_radii: np.ndarray | None = None,
+    accept: Callable | None = None,
+    fixed_points=None,
+    fixed_radii=None,
     oversample: float = 6.0,
     passes: int = 4,
     max_candidates: int = 1 << 23,
     draw: Callable[[np.random.Generator, int], np.ndarray] | None = None,
     n_draw: int | None = None,
-) -> np.ndarray:
+):
     """Variable-radius Poisson-disk sampling as greedy independent sets.
 
     Each pass draws uniform candidates at ``oversample`` per ``min_radius**d``,
     keeps those passing ``accept``, and selects the greedy independent set in a
     random priority order (dart throwing) against all points accepted so far
     and the ``fixed_points``. Conflict rule: ``|x - y| < max(r_x, r_y)``.
-    Refill passes stop when a pass adds nothing. Returns accepted points.
+    Refill passes stop when a pass adds nothing. Returns the accepted points (device).
     ``draw(rng, n)`` replaces the uniform box candidates (for example points on
     a sphere, with ``lo, hi`` a box containing them); ``n_draw`` then sets the
     number of candidates per pass.
+
+    The random draws (candidates, priorities) come from a seeded host RNG and are
+    uploaded once per pass; everything else stays on the device. ``accept`` and
+    ``radius_of`` receive a device array of ``n_draw`` rows (for ``radius_of``: the
+    accepted candidates first, the rest repeating the first one) and may return host
+    or device arrays.
     """
     lo = np.asarray(lo, float)
     hi = np.asarray(hi, float)
@@ -440,38 +606,35 @@ def poisson_disk_sample(
         n_draw = oversample * volume / float(min_radius) ** dim
     n_draw = int(min(max_candidates, max(256, n_draw)))
     n_draw = bucket(n_draw, 256)
-    fixed = np.zeros((0, dim)) if fixed_points is None else np.asarray(fixed_points, float).reshape(-1, dim)
-    fixed_r = (np.full(len(fixed), float(min_radius)) if fixed_radii is None
-               else np.broadcast_to(np.asarray(fixed_radii, float), (len(fixed),)).copy())
-    accepted = np.zeros((0, dim))
-    accepted_r = np.zeros(0)
+    prior = (jnp.zeros((0, dim)) if fixed_points is None else jnp.asarray(fixed_points, float).reshape(-1, dim))
+    n_fixed = int(prior.shape[0])
+    prior_r = (jnp.full(n_fixed, float(min_radius)) if fixed_radii is None
+               else jnp.broadcast_to(jnp.asarray(fixed_radii, float), (n_fixed,)))
+    if n_fixed == 0:
+        prior, prior_r = jnp.zeros((1, dim)), jnp.zeros(1)
+    n_prior = n_fixed
     # Host RNG: O(N) draws/permutations cost milliseconds and add no compile variants.
     rng = np.random.default_rng(int(seed))
     for pass_index in range(int(passes)):
         cand = lo + rng.random((n_draw, dim)) * (hi - lo) if draw is None else np.asarray(draw(rng, n_draw), float)
-        if accept is not None:
-            cand = cand[np.asarray(accept(cand), bool)]
-        if not len(cand):
+        cand = jnp.asarray(cand)
+        ok = jnp.ones(n_draw, bool) if accept is None else jnp.asarray(accept(cand), bool)
+        n_cand = int(jnp.sum(ok))
+        if not n_cand:
             break
-        cand_r = np.asarray(radius_of(cand), float)
-        prior = np.vstack([fixed, accepted])
-        prior_r = np.concatenate([fixed_r, accepted_r])
-        n_prior, n_cand = len(prior), len(cand)
+        cand = _compact_first(cand, ok)
+        cand_r = jnp.asarray(radius_of(cand), float)
         n = n_prior + n_cand
         n_pad = bucket(n)
-        pts = pad_rows(np.vstack([prior, cand]), n_pad, 0.0)
-        rad = pad_rows(np.concatenate([prior_r, cand_r]), n_pad, 0.0)
-        valid = pad_rows(np.ones(n, bool), n_pad, False)
+        perm = np.zeros(n_draw, np.int64)
+        perm[:n_cand] = rng.permutation(n_cand)
+        pts, rad, valid, is_fixed, rank = _pass_layout(prior, prior_r, n_prior, cand, cand_r, n_cand,
+                                                       jnp.asarray(perm), n_pad)
         neighbors = conflict_lists(pts, rad, valid)
-        perm = rng.permutation(n_cand)
-        rank = np.arange(n_pad, dtype=np.int64)
-        rank[n_prior:n] = n_prior + perm
-        is_fixed = pad_rows(np.r_[np.ones(n_prior, bool), np.zeros(n_cand, bool)], n_pad, False)
         in_set, _ = greedy_independent_set(neighbors, rank, fixed=is_fixed, excluded=~valid)
-        take = np.asarray(in_set)[n_prior:n]
-        if not take.any():
+        prior, prior_r, n_take = _pass_accept(pts, rad, in_set, rank, n_prior, n)
+        n_take = int(n_take)
+        if not n_take:
             break
-        order = np.argsort(rank[n_prior:n][take], kind="stable")
-        accepted = np.vstack([accepted, cand[take][order]])
-        accepted_r = np.concatenate([accepted_r, cand_r[take][order]])
-    return accepted
+        n_prior += n_take
+    return prior[n_fixed:n_prior] if n_prior > n_fixed else jnp.zeros((0, dim))

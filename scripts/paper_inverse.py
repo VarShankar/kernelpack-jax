@@ -90,10 +90,11 @@ def run_gn(residual, theta0, max_steps=30, step_tol=1e-10):
     theta = jnp.asarray(theta0)
     J, r = rj(theta); nr = float(jnp.linalg.norm(r))
     for k in range(1, max_steps + 1):
-        Jn, rn = np.asarray(J, float), np.asarray(r, float)
-        if not (np.isfinite(Jn).all() and np.isfinite(rn).all()):
+        # Finite check first (a non-finite matrix must not reach cuSOLVER), then the least-squares step on the
+        # device; rcond=None is eps * max(N, P), the same cutoff as np.linalg.lstsq.
+        if not bool(_finite(J, r)):
             return theta, nr, k, "non-finite residual or Jacobian", False
-        delta = jnp.asarray(np.linalg.lstsq(Jn, -rn, rcond=None)[0], dtype=theta.dtype)
+        delta = _lstsq_step(J, r).astype(theta.dtype)
         t, accepted = 1.0, False
         for _ in range(7):
             trial = theta + t * delta
@@ -112,16 +113,32 @@ def run_gn(residual, theta0, max_steps=30, step_tol=1e-10):
     return theta, nr, max_steps, "max steps", False
 
 
+@jax.jit
+def _finite(*arrays):
+    return jnp.all(jnp.stack([jnp.all(jnp.isfinite(a)) for a in arrays]))
+
+
+@jax.jit
+def _lstsq_step(J, r):
+    return jnp.linalg.lstsq(J, -r, rcond=None)[0]
+
+
+@jax.jit
+def _singular_values(J):
+    return jnp.linalg.svd(J, compute_uv=False)
+
+
 def rel(a, b):
     return float(jnp.linalg.norm(a - b) / jnp.linalg.norm(b))
 
 
 def jacobian_summary(residual, theta):
-    # Host SVD: a non-finite Jacobian must not reach cuSOLVER, whose failure poisons the CUDA context.
-    J = np.asarray(jax.jacfwd(residual)(theta), float)
-    if not np.isfinite(J).all():
+    # Device SVD of the N x P Jacobian, guarded: a non-finite Jacobian must not reach cuSOLVER, whose failure
+    # poisons the CUDA context. Only the P singular values come back to the host.
+    J = jax.jacfwd(residual)(theta)
+    if not bool(_finite(J)):
         return dict(jacobian_singular_values=None, jacobian_condition=None)
-    s = np.linalg.svd(J, compute_uv=False)
+    s = np.asarray(_singular_values(J), float)
     return dict(jacobian_singular_values=s.tolist(), jacobian_condition=float(s.max() / s.min()) if s.min() > 0 else None)
 
 
@@ -238,7 +255,7 @@ def rd_group(domain, order, families, dt_factor, cfl_factor=None, warm=None):
                 yield family, dict(status="spectral_rejected", reason=spectral.get("reason"),
                                    shared_setup_s=time.perf_counter() - t0)
             return
-        wrapper = StatelessReactionDiffusionSolver.from_solver(solver)
+        wrapper = StatelessReactionDiffusionSolver.from_solver(solver, prepare_orders=(3,))   # rollout is BDF3 only
         setup_s = time.perf_counter() - t0
         bc = lambda _a, _b, nr, t, z: normal_derivative(lambda q: rd.exact_state(t, q), z, nr)   # du/dn = g
         history = tuple(rd.exact_state(k * dt, solver.x) for k in range(3))
@@ -300,6 +317,20 @@ def transport_group(domain, geometry, order, families, dt_factor, target_speed, 
             return values
         return velocity
 
+    # gamma uses the nominal U_max (as in the forward problem), so it, the generator check nu L + gamma H and the
+    # SBDF3 factorization are the same for every family: compute them once per (cloud, order).
+    gamma = jnp.asarray(gamma_unit) * target_speed
+    spectral, wrapper, generator_s = None, None, 0.
+    if laplacian["passed"]:
+        t1 = time.perf_counter()
+        solver.close_cudss()                       # the factor of the estimate's gamma is not used
+        solver.set_gamma_components(gamma)
+        spectral = dirichlet_implicit_generator_precheck(solver.lap_sparse, solver.hyper_sparse, solver.bc_sparse,
+                                                         domain, nu=float(solver.nu), gamma=float(jnp.sum(gamma)))
+        if spectral["passed"]:
+            wrapper = StatelessEulerianAdvectionDiffusionReactionSolver.from_solver(solver, prepare_orders=(3,))
+        generator_s = time.perf_counter() - t1
+
     try:
         for family in families:
             if not laplacian["passed"]:
@@ -312,17 +343,11 @@ def transport_group(domain, geometry, order, families, dt_factor, target_speed, 
             theta_true = rv.transport_theta(geometry, family, theta_ref, target_speed)   # fixed per geometry
             v_true = jnp.einsum("i,ind->nd", theta_true, basis)
             speed = float(jnp.max(jnp.linalg.norm(v_true, axis=1)))
-            gamma = jnp.asarray(gamma_unit) * target_speed     # nominal U_max, as in the forward problem
-            solver.close_cudss()                   # drop the factor of the previous gamma
-            solver.set_gamma_components(gamma)
-            spectral = dirichlet_implicit_generator_precheck(solver.lap_sparse, solver.hyper_sparse, solver.bc_sparse,
-                                                             domain, nu=float(solver.nu), gamma=float(jnp.sum(gamma)))
             if not spectral["passed"]:
                 yield family, dict(status="spectral_rejected", reason=spectral.get("reason"), shared_setup_s=shared_s,
                                    true_max_speed=speed)
                 continue
-            wrapper = StatelessEulerianAdvectionDiffusionReactionSolver.from_solver(solver, prepare_orders=(3,))
-            setup_s = shared_s + time.perf_counter() - t1
+            setup_s = shared_s + generator_s + time.perf_counter() - t1
             forcing = ad.manufactured_forcing(solver.nu, velocity_of(v_true), 0.)   # frozen at the truth
 
             @jax.jit

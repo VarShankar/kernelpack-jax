@@ -1203,9 +1203,12 @@ class FDDiffOp:
                 or not bool(jnp.all(stencil_graph.periodic_bounds==domain.periodic_bounds)
                             &jnp.all(stencil_graph.periodic_dims==domain.periodic_dims))):
                 raise ValueError("stencil graph periodic bounds/mask are stale")
-            active_rows = jnp.asarray(stencil_graph.active_rows, dtype=int) if active_rows is None else jnp.asarray(active_rows, dtype=int)
-            if active_rows.shape != stencil_graph.active_rows.shape or not bool(jnp.all(active_rows == stencil_graph.active_rows)):
-                raise ValueError("active_rows must match the supplied stencil graph")
+            if active_rows is None:
+                active_rows = jnp.asarray(stencil_graph.active_rows, dtype=int)
+            else:
+                active_rows = jnp.asarray(active_rows, dtype=int)
+                if active_rows.shape != stencil_graph.active_rows.shape or not bool(jnp.all(active_rows == stencil_graph.active_rows)):
+                    raise ValueError("active_rows must match the supplied stencil graph")
             knn_indices = jnp.asarray(stencil_graph.knn_indices, dtype=int)
         else:
             if active_rows is None:
@@ -1218,8 +1221,10 @@ class FDDiffOp:
             knn_indices = knn_indices + 1
         active_centers = center_points[active_rows - 1]
         local_coordinates=domain.stencil_coordinates(st_props.tree_mode,active_centers,knn_indices-1)
-        self.n1 = int(center_row_ids.max(initial=0))
-        self.n2 = int(stencil_globals.max(initial=0))
+        # _pick_centers numbers the rows 1..n and every tree has contiguous global numbering
+        # (DomainDescriptor.get_tree_globals), so both maxima follow from shapes (no device read).
+        self.n1 = int(center_row_ids.shape[0])
+        self.n2 = _tree_global_max(domain, st_props.tree_mode, stencil_globals)
         matrix = None if op_props.sparse_only else jnp.zeros((self.n1, self.n2), dtype=float)
         self.stencils = []
         self.recorded_stencil_centers = []
@@ -1448,6 +1453,17 @@ def _pick_centers(domain: DomainDescriptor, point_set: str) -> tuple[jnp.ndarray
     else:
         raise ValueError("unknown point set")
     return points, row_ids, col_globals, normals
+
+
+def _tree_global_max(domain: DomainDescriptor, tree_mode: str, stencil_globals: jnp.ndarray) -> int:
+    """Largest one-based global id of a tree: start + size - 1 of its contiguous numbering."""
+    if stencil_globals.shape[0] == 0:
+        return 0
+    if isinstance(domain, DomainDescriptor):
+        mode = StencilProperties.normalize_tree_mode(tree_mode)
+        offset = domain.get_num_interior_nodes() if mode == "boundary" else 0
+        return offset + int(stencil_globals.shape[0])
+    return int(stencil_globals.max())
 
 
 def _tree_column_count(domain: DomainDescriptor, tree_mode: str) -> int:

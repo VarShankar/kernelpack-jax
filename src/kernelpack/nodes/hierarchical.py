@@ -56,16 +56,16 @@ def _points_in_polygon_masked(points, outline, edge_valid):
     return lax.map(contains, points, batch_size=256)
 
 
-def points_in_polygon_bucketed(points, outline):
-    """``points_in_polygon`` with power-of-two padded shapes (one compile per bucket).
+def points_in_polygon_device(points, outline):
+    """``points_in_polygon`` with power-of-two padded shapes (one compile per bucket); device mask.
 
     The outline is closed by its own last edge; padding edges are masked out.
     """
-    from kernelpack.accelerators.jax_spatial import bucket, pad_rows
-    pts = np.asarray(points, float)
+    from kernelpack.accelerators.jax_spatial import bucket, pad_rows, pad_rows_device
+    pts = jnp.asarray(points, float)
     loop = np.asarray(outline, float)
-    if len(pts) == 0:
-        return np.zeros(0, bool)
+    if pts.shape[0] == 0:
+        return jnp.zeros(0, bool)
     m = len(loop)
     m_pad = bucket(m + 1, 8)
     # Closing edge (last -> first) is explicit; the padded tail repeats the first
@@ -75,9 +75,14 @@ def points_in_polygon_bucketed(points, outline):
     padded[m + 1:] = loop[0]
     edge_valid = np.zeros(m_pad, bool)
     edge_valid[:m] = True
-    n_pad = bucket(len(pts), 256)
-    inside = _points_in_polygon_masked(jnp.asarray(pad_rows(pts, n_pad, 0.0)), jnp.asarray(padded), jnp.asarray(edge_valid))
-    return np.array(inside)[:len(pts)]
+    n = pts.shape[0]
+    inside = _points_in_polygon_masked(pad_rows_device(pts, bucket(n, 256), 0.0), jnp.asarray(padded), jnp.asarray(edge_valid))
+    return inside[:n]
+
+
+def points_in_polygon_bucketed(points, outline):
+    """Host-mask wrapper of ``points_in_polygon_device``."""
+    return np.array(points_in_polygon_device(points, outline))
 
 
 def sample_planar_face(outline, radius, *, seed=0, smooth=True,
@@ -117,9 +122,9 @@ def sample_planar_face(outline, radius, *, seed=0, smooth=True,
         # Dart throwing as a greedy independent set on device, restricted to the
         # face; the outline test is the acceptance predicate.
         from kernelpack.accelerators.jax_spatial import poisson_disk_sample
-        inside = poisson_disk_sample(mins, maxs, lambda p: np.full(len(p), candidate_radius), candidate_radius,
-                                     seed=int(seed), accept=lambda p: points_in_polygon_bucketed(p, curve))
-        return jnp.asarray(np.vstack([boundary, inside]))
+        inside = poisson_disk_sample(mins, maxs, lambda p: jnp.full(p.shape[0], candidate_radius), candidate_radius,
+                                     seed=int(seed), accept=lambda p: points_in_polygon_device(p, curve))
+        return jnp.vstack([jnp.asarray(boundary), inside])
     if backend == "warp" or (backend == "auto" and warp_available()):
         opts = WarpBridsonOptions(candidate_radius, candidate_radius, 30, int(seed),
             "fixed_radius", 1., 0., np.zeros((0, 2)))
@@ -172,7 +177,8 @@ def sample_parametric_face(model,outlines,radius,*,seed=0,backend="auto",supersa
     candidates=sample_planar_face(loops[0],parameter_radius,seed=seed,smooth=False,
         supersample_fac=supersample_fac,backend=backend)
     for hole in loops[1:]:
-        candidates=candidates[~points_in_polygon_bucketed(candidates,hole)]
+        from kernelpack.accelerators.jax_spatial import compact_rows
+        candidates=compact_rows(~points_in_polygon_device(candidates,hole),candidates)
         lengths=np.linalg.norm(np.roll(hole,-1,axis=0)-hole,axis=1)
         edges=[]; step=parameter_radius/np.sqrt(supersample_fac)
         for a,b,length in zip(hole,np.roll(hole,-1,axis=0),lengths):

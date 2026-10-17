@@ -19,7 +19,7 @@ from ._common import (
 )
 from .reaction_diffusion import ReactionDiffusionSolver, _evaluate_reaction_callback, _solve_lineax_system
 from copy import copy
-from ._cudss import solve_transient_cudss, get_transient_cudss_factor
+from ._cudss import solve_transient_cudss, get_transient_cudss_factor, prepare_transient_cudss
 
 
 @dataclass(frozen=True)
@@ -34,7 +34,13 @@ class StatelessReactionDiffusionSolver:
     base: ReactionDiffusionSolver
 
     @classmethod
-    def from_solver(cls, solver: ReactionDiffusionSolver) -> "StatelessReactionDiffusionSolver":
+    def from_solver(cls, solver: ReactionDiffusionSolver, *, prepare_orders=(1, 2, 3)) -> "StatelessReactionDiffusionSolver":
+        """Wrap a prepared solver. With cuDSS, factor the BDF systems of ``prepare_orders`` now.
+
+        ``march_to_final_state`` uses orders 1, 2 and 3 (the default). A rollout that only calls
+        ``bdf3_state`` (history supplied by the caller) needs ``prepare_orders=(3,)``; an order that was
+        not prepared is factored lazily on first eager use, or solved by the unprepared cuDSS path when traced.
+        """
         if solver.n <= 0:
             raise ValueError("StatelessReactionDiffusionSolver requires an initialized ReactionDiffusionSolver")
         if solver.bc_sparse is None:
@@ -42,7 +48,7 @@ class StatelessReactionDiffusionSolver:
         if solver.linear_solver == "gmres_ilu" and solver.fixed_preconditioner is None:
             raise ValueError("Call prepare_preconditioner(...) on the base solver before stateless gmres_ilu marching")
         if solver.linear_solver == "cudss":
-            solver.prepare_cudss()
+            prepare_transient_cudss(solver, orders=tuple(prepare_orders))
             return cls(copy(solver))
         return cls(solver)
 
