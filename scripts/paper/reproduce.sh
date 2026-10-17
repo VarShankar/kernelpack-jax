@@ -54,6 +54,7 @@ stats)       # parallel-algorithm and stencil-crossing statistics (Sections 6.1,
   run $PY scripts/paper_node_stats.py $C $C/node_stats.json
   run $PY scripts/paper_stencil_stats.py $C $C/stencil_stats.jsonl
   run $PY scripts/paper_velocity_fields.py
+  run $PY scripts/paper_plot_masks.py         # exact domain masks for the field plots
   run $PY scripts/paper_obstacle_solution_fields.py ;;
 figures)     # tables (KernelPackJaxPaper/gen_*.tex), plot data, and the matplotlib node renderings
   run $PY scripts/paper_figures.py

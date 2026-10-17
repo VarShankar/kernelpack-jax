@@ -1,4 +1,5 @@
-function paper_plots()
+function paper_plots(only)
+% paper_plots() draws every figure; paper_plots('velocity') only the velocity panels and their colorbar.
 % Convergence and timing plots of the paper from Outputs_and_results/paper_figures/plot_data.json
 % (written by scripts/paper_figures.py). One PDF per panel and one legend PDF per figure, written with
 % export_fig to KernelPackJaxPaper/Images/plots/; the paper arranges them in LaTeX. Panels are drawn at
@@ -14,6 +15,7 @@ user_string('ghostscript', [gs '\bin\gswin64c.exe']);
 D = jsondecode(fileread(fullfile(root, 'Outputs_and_results', 'paper_figures', 'plot_data.json')));
 out = fullfile(root, 'KernelPackJaxPaper', 'Images', 'plots');
 if ~exist(out, 'dir'), mkdir(out); end
+if nargin > 0 && strcmp(only, 'velocity'), velocity(D.velocity, out); return; end
 convergence(D.forward, 'forward', out);
 convergence(D.inverse, 'inverse', out);
 convergence_legend(out);
@@ -302,7 +304,11 @@ for k = 1:numel(names)
     w = 6.4; hgt = w*(max(y)-min(y))/(max(x)-min(x)) + 1.3;
     fig = figure('Units', 'centimeters', 'Position', [2 2 w+1.2 hgt], 'Color', 'w');
     ax = axes(fig); hold(ax, 'on');
-    im = imagesc(ax, x, y, s); set(im, 'AlphaData', ~isnan(s));
+    K = jsondecode(fileread(fullfile(fileparts(out), '..', '..', 'Outputs_and_results', 'paper_figures', 'plot_masks.json')));
+    g = regexprep(names{k}, '_(forward|transport_smooth|transport_c1)$', '');
+    Mk = cell2mat(cellfun(@(r) r == '1', K.(g).rows, 'UniformOutput', false));
+    [xf, yf, sf] = upsample(x, y, s, 4, Mk);
+    im = imagesc(ax, xf, yf, sf); set(im, 'AlphaData', ~isnan(sf));
     set(ax, 'YDir', 'normal'); colormap(ax, parula(256)); clim(ax, [0 vmax]);
     uu = u; vv = v; uu(isnan(uu)) = 0; vv(isnan(vv)) = 0;
     [X, Y] = meshgrid(x, y);
@@ -313,13 +319,14 @@ for k = 1:numel(names)
     xlabel(ax, '$x$', 'Interpreter', 'latex', 'FontSize', S.font+1);
     if startsWith(names{k}, 'h_channel'), yl = '$y$'; else, yl = '$z$'; end
     ylabel(ax, yl, 'Interpreter', 'latex', 'FontSize', S.font+1);
-    export_fig(fig, fullfile(out, ['velocity_' names{k}]), '-pdf', '-painters', '-transparent');
+    export_fig(fig, fullfile(out, ['velocity_' names{k}]), '-pdf', '-opengl', '-r600');   % raster: painters downsamples images
     close(fig);
 end
 % colorbar for all panels
-fig = figure('Units', 'centimeters', 'Position', [2 2 6.4 1.6], 'Color', 'w');
-ax = axes(fig); axis(ax, 'off'); colormap(ax, parula(256)); clim(ax, [0 vmax]);
-cb = colorbar(ax, 'southoutside'); cb.Position = [0.1 0.45 0.8 0.18];
+fig = figure('Units', 'centimeters', 'Position', [2 2 6.4 2.6], 'Color', 'w');
+ax = axes(fig, 'Units', 'centimeters', 'Position', [0.6 2.3 5.2 0.1]); axis(ax, 'off');
+colormap(ax, parula(256)); clim(ax, [0 vmax]);
+cb = colorbar(ax, 'southoutside');                    % ticks and label below the bar
 cb.TickLabelInterpreter = 'latex'; cb.FontSize = S.font; cb.Label.String = 'speed $\|v\|$';
 cb.Label.Interpreter = 'latex'; cb.Label.FontSize = S.font+1;
 export_fig(fig, fullfile(out, 'legend_velocity'), '-pdf', '-painters', '-transparent');
@@ -438,4 +445,42 @@ set(ax, 'FontSize', S.font, 'LineWidth', 0.7, 'Box', 'on', 'TickLabelInterpreter
 % panel titles are set in LaTeX, so that all four panels share one canvas and one font
 export_fig(fig, file, '-pdf', '-painters', '-nocrop');
 close(fig);
+end
+
+function [xf, yf, F] = upsample(x, y, F, k, M)
+% Display only: values on a k times finer grid by local PHS + polynomial interpolation with the basis of
+% the paper (Section 3.1) for p = 4 in the plane (d = 2): r^m with m = max(p+1,5) = 5, polynomials of total
+% degree p+1 = 5, and the n_s = 2*nchoosek(p+1+d,d)+1 = 43 nearest grid values inside the domain, in
+% coordinates centered and scaled per stencil. M is the exact domain mask on the fine grid
+% (scripts/paper_plot_masks.py), so the edge is not drawn in whole cells of the computation grid.
+p = 4; d = 2; m = max(p+1, 5); deg = p+1; ns = 2*nchoosek(deg+d, d)+1;
+xf = linspace(x(1), x(end), k*(numel(x)-1)+1); yf = linspace(y(1), y(end), k*(numel(y)-1)+1);
+[X, Y] = meshgrid(x, y); [Xf, Yf] = meshgrid(xf, yf);
+inside = ~isnan(F);
+P = [X(inside) Y(inside)]; f = F(inside);
+Q = [Xf(M) Yf(M)];
+[ex, ey] = meshgrid(0:deg, 0:deg); keep = ex + ey <= deg; ex = ex(keep)'; ey = ey(keep)'; np = numel(ex);
+vals = zeros(size(Q, 1), 1);
+chunk = 2000;
+for s = 1:chunk:size(Q, 1)
+    I = s:min(s+chunk-1, size(Q, 1)); q = Q(I, :); nq = numel(I);
+    D2 = (q(:,1) - P(:,1)').^2 + (q(:,2) - P(:,2)').^2;          % nq x |P|
+    [~, nb] = mink(D2, ns, 2);                                     % nq x ns nearest inside values
+    sx = reshape(P(nb, 1), nq, ns); sy = reshape(P(nb, 2), nq, ns);
+    cx = mean(sx, 2); cy = mean(sy, 2);
+    sc = max(sqrt((sx - cx).^2 + (sy - cy).^2), [], 2);             % scale per stencil
+    sx = (sx - cx)./sc; sy = (sy - cy)./sc; qx = (q(:,1) - cx)./sc; qy = (q(:,2) - cy)./sc;
+    A = zeros(ns+np, ns+np, nq); b = zeros(ns+np, 1, nq);
+    R = sqrt((permute(sx, [2 3 1]) - permute(sx, [3 2 1])).^2 + (permute(sy, [2 3 1]) - permute(sy, [3 2 1])).^2);
+    A(1:ns, 1:ns, :) = R.^m;
+    Pm = permute(sx, [2 3 1]).^ex .* permute(sy, [2 3 1]).^ey;    % ns x np x nq
+    A(1:ns, ns+1:end, :) = Pm; A(ns+1:end, 1:ns, :) = permute(Pm, [2 1 3]);
+    rq = sqrt((permute(sx, [2 3 1]) - permute(qx, [2 3 1])).^2 + (permute(sy, [2 3 1]) - permute(qy, [2 3 1])).^2);
+    b(1:ns, 1, :) = rq.^m;
+    b(ns+1:end, 1, :) = permute(qx, [2 3 1]).^(ex(:)) .* permute(qy, [2 3 1]).^(ey(:));
+    w = pagemldivide(A, b);                                        % interpolation weights per point
+    fv = reshape(f(nb)', ns, 1, nq);
+    vals(I) = squeeze(sum(w(1:ns, 1, :).*fv, 1));
+end
+F = NaN(size(Xf)); F(M) = vals;
 end
