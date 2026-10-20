@@ -155,14 +155,72 @@ class DomainDescriptor:
         """Select stencils by ray tracing against the implicit layer `model` (a CFPU model); None disables."""
         if model is None:
             self.stencil_level_set = None
+            self._clear_stencil_cache()
             return
         if self.periodic_bounds is not None:
             raise ValueError("Periodic and level-set-filtered stencils cannot be combined")
         from kernelpack.domain.boundary_aware import StencilLevelSet
         self.stencil_level_set = StencilLevelSet(model, self.sep_rad if h is None else h, **options)
+        self._clear_stencil_cache()
+
+    def _clear_stencil_cache(self):
+        """Discard selections and sampled geometry when their inputs change."""
         self._stencil_phi_nodes = {}
         self._stencil_memo = {}
         self._stencil_owner = {}
+        self._stencil_signature = None
+        self._stencil_signature_refs = ()
+
+    def _stencil_cache_signature(self):
+        """Hashable identity of the current immutable buffers and geometry policy.
+
+        JAX arrays cannot be mutated in place; replacing any point, active-mask,
+        or model buffer changes this signature. References are retained as long
+        as the memo is retained, so Python object-id reuse cannot create a hit.
+        Higher-level factor caches can pin this same signature. Query contents
+        remain separately fingerprinted and checked for exact equality.
+        """
+        references = []
+
+        def token(value):
+            if isinstance(value, jax.Array):
+                references.append(value)
+                return (id(value), tuple(value.shape), str(value.dtype),
+                        tuple(sorted(str(device) for device in value.devices())))
+            if isinstance(value, dict):
+                return tuple((key, token(item)) for key, item in sorted(value.items()))
+            if isinstance(value, (list, tuple)):
+                return tuple(token(item) for item in value)
+            if value is None or isinstance(value, (bool, int, float, str)):
+                return value
+            references.append(value)
+            return (type(value).__module__, type(value).__qualname__, id(value))
+
+        phi = self.stencil_level_set
+        if phi is None:
+            geometry = None
+        else:
+            model = phi.model
+            references.extend((phi, model))
+            # CFPU exposes precisely the numerical evaluation inputs. The
+            # fallback supports other explicit level-set models without making
+            # diagnostics/evaluation counters part of the numerical identity.
+            model_data = (model.args() if callable(getattr(model, "args", None))
+                          else {key: value for key, value in vars(model).items()
+                                if key not in {"diagnostics", "evaluations"}})
+            geometry = (id(phi), id(model), phi.h, phi.lipschitz, phi.delta,
+                        phi.eps, phi.cap, phi.scale, token(model_data),
+                        token(getattr(model, "band", None)))
+        signature = (geometry, token((self.xi, self.xb, self.xg, self.x, self.xf)),
+                     token((self.interior_active, self.boundary_active, self.ghost_active)),
+                     token((self.periodic_bounds, self.periodic_dims)), self.sep_rad)
+        if getattr(self, "_stencil_signature", None) != signature:
+            self._stencil_phi_nodes = {}
+            self._stencil_memo = {}
+            self._stencil_owner = {}
+            self._stencil_signature = signature
+            self._stencil_signature_refs = tuple(references)
+        return signature
 
     def _boundary_aware_knn(self, tree_mode: str, query_points, k: int, backend: str):
         from kernelpack.domain.boundary_aware import boundary_aware_knn
@@ -170,13 +228,17 @@ class DomainDescriptor:
         _, points = self._get_tree_data(tree_mode)
         n_tree = int(points.shape[0])
         q = jnp.atleast_2d(jnp.asarray(query_points, dtype=float))
+        self._stencil_cache_signature()
         # Memo of selected stencils, keyed by a device fingerprint of the query and confirmed by equality.
         memo = getattr(self, "_stencil_memo", {})
         key = (tree_mode, int(k), tuple(q.shape), tuple(_query_fingerprint(q).tolist()))
         hit = memo.get(key)
         if hit is not None and bool(jnp.array_equal(hit[0], q)):
             return hit[1]
-        K = min(4 * int(k), n_tree)
+        n_active = self._active_count(tree_mode)
+        if not 0 < int(k) <= n_active:
+            raise ValueError("KNN stencil size exceeds the number of active tree points")
+        K = min(4 * int(k), n_tree, n_active)
         idx, dist = self.query_knn(tree_mode, q, K, backend=backend, _euclidean=True)
         if not bool(_centers_are_tree_points(points, idx[:, 0], q)):
             return idx[:, :k], dist[:, :k]                   # centers that are not tree points: Euclidean

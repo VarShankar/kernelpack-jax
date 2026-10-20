@@ -7,7 +7,6 @@ Away from the cover, two geometry quadratures check the boundary-flux sign.
 """
 from dataclasses import dataclass, field
 from functools import partial
-import numpy as np
 import jax
 import jax.numpy as jnp
 from jax import jit, lax
@@ -174,7 +173,7 @@ def _overlap_counts(points,centers,radii,chunk):
 def _local_batch(n,width,capacity,dim,budget=1<<26):
     """Points per vmapped block so the (block, width, capacity, dim) temporaries fit."""
     per=max(1,width*capacity*dim)
-    batch=1<<int(np.floor(np.log2(max(1,budget//per))))
+    batch=1<<(max(1,budget//per).bit_length()-1)
     return int(min(n,max(1,batch)))
 
 
@@ -208,7 +207,7 @@ def _groups(model,pts):
     from .parametric_pu import device_groups,take_rows,pad_device
     n=pts.shape[0]; patches=int(model.centers.shape[0])
     n_pad=bucket(n); chunk=min(n_pad,max(64,(1<<22)//max(1,patches)))
-    chunk=1<<int(np.floor(np.log2(chunk)))
+    chunk=1<<(max(1,chunk).bit_length()-1)
     counts=_overlap_counts(pad_device(pts,n_pad),model.centers,model.radii,chunk)[:n]
     for w,count,ids in device_groups(counts):
         yield int(min(w,patches)),count,ids,take_rows(pts,ids)
@@ -347,10 +346,11 @@ def _band_components(labels,free):
 def _build_band(model,points):
     """Sign of phi on the uncovered region, by connected components of a background grid."""
     pts=jnp.asarray(points,dtype=float)
-    lo=np.asarray(jnp.min(pts,axis=0)); hi=np.asarray(jnp.max(pts,axis=0)); pad=0.05*(hi-lo)+1e-12
+    lo=jnp.min(pts,axis=0); hi=jnp.max(pts,axis=0); pad=0.05*(hi-lo)+1e-12
     lo=lo-pad; hi=hi+pad
     cell=0.5*float(jnp.min(model.radii))
-    shape=tuple(int(s) for s in np.maximum(1,np.ceil((hi-lo)/cell)).astype(int))
+    # Only the small integer grid shape leaves the device for allocation.
+    shape=tuple(int(s) for s in jnp.maximum(1,jnp.ceil((hi-lo)/cell)).astype(jnp.int32))
     local,weight=_local_only(model,_band_centres(jnp.asarray(lo),cell,shape))
     free,cell_sign=_band_cells(local,weight,shape)
     labels=_label_components(free)
@@ -441,47 +441,49 @@ def _piece_quadrature(segment,order):
 
     Returns the mapped quadrature points, their area-weighted normals, the parameters, and one boolean
     footprint mask per parametric support (rectangle or spherical cap) over the parameters."""
-    from kernelpack.nodes.hierarchical import points_in_polygon_bucketed
+    from kernelpack.nodes.hierarchical import points_in_polygon_device
+    from kernelpack.accelerators.jax_spatial import compact_rows
     model=segment.geom_model
     if model.get('type')=='spherical-pu':
         # Closed piece over S^{d-1}: product rule on the sphere, metric of the map along an orthonormal
         # tangent basis, so area = w |J t_1 x J t_2| (d = 3) or w |J t_1| (d = 2).
         from .spherical_pu import sphere_quadrature
         pu=model['model']; u,qw=sphere_quadrature(pu.dim,order)
-        xyz=np.asarray(pu.evaluate(u)); jac,normal=map(np.asarray,pu.frame(u))
+        xyz=jnp.asarray(pu.evaluate(u)); jac,normal=map(jnp.asarray,pu.frame(u))
         normal=normal*model.get('normal_sign',1.)
-        metric=np.linalg.norm(jac[:,:,0],axis=1) if pu.dim==2 else np.linalg.norm(np.cross(jac[:,:,0],jac[:,:,1]),axis=1)
+        metric=jnp.linalg.norm(jac[:,:,0],axis=1) if pu.dim==2 else jnp.linalg.norm(jnp.cross(jac[:,:,0],jac[:,:,1]),axis=1)
         footprints=[pu.cap_mask(u,j) for j in range(int(pu.centers.shape[0]))]
         return xyz,normal*(qw*metric)[:,None],u,footprints
     if model.get('type')=='parametric-pu':
         outlines=model.get('outlines')
         if outlines is None: raise ValueError('CFPU requires the physical parameter footprint')
-        pu=model['model']; lower=np.asarray(outlines[0]).min(axis=0); upper=np.asarray(outlines[0]).max(axis=0)
-        parent_centers=np.asarray(pu.centers)*np.asarray(pu.scale)+np.asarray(pu.offset)
-        parent_widths=np.asarray(pu.widths)*np.asarray(pu.scale)
+        pu=model['model']; lower=jnp.asarray(outlines[0]).min(axis=0); upper=jnp.asarray(outlines[0]).max(axis=0)
+        parent_centers=jnp.asarray(pu.centers)*jnp.asarray(pu.scale)+jnp.asarray(pu.offset)
+        parent_widths=jnp.asarray(pu.widths)*jnp.asarray(pu.scale)
         mapper=pu.evaluate; frame=pu.frame
         normal_sign=model.get('normal_sign',1.)
     elif model.get('type')=='affine-face':
-        outlines=model['outlines']; lower=np.asarray(outlines[0]).min(axis=0); upper=np.asarray(outlines[0]).max(axis=0)
-        parent_centers=np.asarray(model['cover_centers']); parent_widths=np.asarray(model['cover_widths'])
+        outlines=model['outlines']; lower=jnp.asarray(outlines[0]).min(axis=0); upper=jnp.asarray(outlines[0]).max(axis=0)
+        parent_centers=jnp.asarray(model['cover_centers']); parent_widths=jnp.asarray(model['cover_widths'])
         origin=jnp.asarray(model['origin']); basis=jnp.asarray(model['basis']); normal=jnp.asarray(model['normal'])
         mapper=lambda uv:origin+jnp.asarray(uv)@basis.T
         frame=lambda uv:(jnp.broadcast_to(basis,(len(uv),*basis.shape)),jnp.broadcast_to(normal,(len(uv),len(normal))))
         normal_sign=1.
     else:
         raise ValueError('CFPU requires shared PU pieces (parametric or spherical) or explicit affine-face geometry; legacy global patches are unsupported')
-    nodes,weights=np.polynomial.legendre.leggauss(order)
+    from .spherical_pu import gauss_legendre
+    nodes,weights=gauss_legendre(order)
     axes=[(a+b)/2+(b-a)*nodes/2 for a,b in zip(lower,upper)]
     weight_axes=[(b-a)*weights/2 for a,b in zip(lower,upper)]
-    uv=np.stack(np.meshgrid(*axes,indexing='ij'),axis=-1).reshape(-1,len(lower))
-    qw=np.prod(np.stack(np.meshgrid(*weight_axes,indexing='ij'),axis=-1),axis=-1).ravel()
+    uv=jnp.stack(jnp.meshgrid(*axes,indexing='ij'),axis=-1).reshape(-1,len(lower))
+    qw=jnp.prod(jnp.stack(jnp.meshgrid(*weight_axes,indexing='ij'),axis=-1),axis=-1).ravel()
     if len(lower)==2:
-        keep=points_in_polygon_bucketed(uv,np.asarray(outlines[0]))
-        for hole in outlines[1:]: keep &= ~points_in_polygon_bucketed(uv,np.asarray(hole))
-        uv=uv[keep]; qw=qw[keep]
-    xyz=np.asarray(mapper(uv)); jac,normal=frame(uv); jac,normal=np.asarray(jac),np.asarray(normal)*normal_sign
-    metric=np.linalg.norm(jac[:,:,0],axis=1) if len(lower)==1 else np.linalg.norm(np.cross(jac[:,:,0],jac[:,:,1]),axis=1)
-    footprints=[np.all(np.abs(uv-center)<width,axis=1) for center,width in zip(parent_centers,parent_widths)]
+        keep=points_in_polygon_device(uv,jnp.asarray(outlines[0]))
+        for hole in outlines[1:]: keep &= ~points_in_polygon_device(uv,jnp.asarray(hole))
+        uv,qw=compact_rows(keep,uv,qw)
+    xyz=jnp.asarray(mapper(uv)); jac,normal=frame(uv); jac,normal=jnp.asarray(jac),jnp.asarray(normal)*normal_sign
+    metric=jnp.linalg.norm(jac[:,:,0],axis=1) if len(lower)==1 else jnp.linalg.norm(jnp.cross(jac[:,:,0],jac[:,:,1]),axis=1)
+    footprints=[jnp.all(jnp.abs(uv-center)<width,axis=1) for center,width in zip(parent_centers,parent_widths)]
     return xyz,normal*(qw*metric)[:,None],uv,footprints
 
 
@@ -533,9 +535,26 @@ def _all_finite(*arrays):
     return all(bool(jnp.all(jnp.isfinite(a))) for a in arrays)
 
 
+@jit
+def _footprint_envelope(points,mask,spacing,inflation):
+    """Mapped support envelope without a host copy or a ragged point gather."""
+    count=jnp.sum(mask)
+    center=jnp.sum(jnp.where(mask[:,None],points,0.),axis=0)/jnp.maximum(count,1)
+    extent=jnp.max(jnp.where(mask,_norm(points-center),0.))
+    return center,inflation*jnp.maximum(extent,2*spacing),count
+
+
+@jit
+def _site_capacities(counts):
+    # Counts are at least min_sites here, so every capacity is positive.
+    return jnp.left_shift(jnp.ones_like(counts),
+        jnp.ceil(jnp.log2(counts)).astype(counts.dtype))
+
+
 def build_cfpu(segments,points,normals,*,options=CFPUOptions(),cover=None):
     """Map one existing geometry support to each ambient ball, then fit CFPU."""
-    from kernelpack.accelerators.jax_spatial import bucket,pad_rows
+    from kernelpack.accelerators.jax_spatial import bucket,pad_rows_device,compact_rows
+    from kernelpack.domain.stencils import select_stencils
     from .parametric_pu import pad_device
     points=jnp.asarray(points,dtype=float); normals=jnp.asarray(normals,dtype=float)
     if points.ndim!=2 or points.shape[1] not in (2,3) or normals.shape!=points.shape or not _all_finite(points,normals):
@@ -547,61 +566,62 @@ def build_cfpu(segments,points,normals,*,options=CFPUOptions(),cover=None):
     normals=normals/jnp.linalg.norm(normals,axis=1)[:,None]
     if not _all_finite(normals): raise ValueError('CFPU normals must be nonzero')
     n=len(points); dim=points.shape[1]
-    scale=float(np.linalg.norm(np.asarray(jnp.max(points,axis=0)-jnp.min(points,axis=0))))
+    scale=float(jnp.linalg.norm(jnp.max(points,axis=0)-jnp.min(points,axis=0)))
+    if n<options.min_sites: raise ValueError('CFPU needs more oriented geometry samples')
     n_pad=bucket(n,64)
     far=jnp.where(jnp.arange(n_pad)[:,None]<n,0.,1e300)
     pts_dev=pad_device(points,n_pad)+far
-    # Host kNN: the device brute force differs by 1 ulp on CPU (XLA contracts inside lax.map), and the
-    # spacing sets support radii, so bit-identity needs cKDTree's arithmetic.
-    from scipy.spatial import cKDTree
-    host=np.asarray(points); spacing=float(np.median(cKDTree(host).query(host,k=2)[0][:,1]))
+    # Shared bounded-memory device kNN.  This preserves the median nearest-site
+    # spacing rule; floating-point identity with an old SciPy run is not claimed.
+    _,nearest,valid=select_stencils(points,points,k=2)
+    if not bool(jnp.all(valid)): raise ValueError('CFPU nearest-site spacing search failed')
+    spacing=jnp.median(_norm(nearest[:,1]-points))
+    if not bool(jnp.isfinite(spacing)&(spacing>0.)):
+        raise ValueError('CFPU needs distinct oriented geometry samples')
     coarse=[]; fine=[]; centers=[]; radii=[]; parents=[]
     for index,segment in enumerate(segments):
         coarse.append(_piece_quadrature(segment,options.quadrature_order)[:2])
         xyz,area,uv,footprints=_piece_quadrature(segment,2*options.quadrature_order)
         fine.append((xyz,area))
         for patch,inside in enumerate(footprints):
-            footprint=xyz[inside]
-            if not len(footprint): continue
+            world_center,radius,count=_footprint_envelope(xyz,jnp.asarray(inside),spacing,options.support_inflation)
+            if not int(count): continue
             # The mapped sampled footprint sets the envelope; bounded inflation
             # gives ambient thickness without solving for parameter coordinates.
-            world_center=footprint.mean(axis=0)
-            radius=options.support_inflation*max(float(np.linalg.norm(footprint-world_center,axis=1).max()),2*spacing)
             centers.append(world_center); radii.append(radius); parents.append((index,patch))
-    centers=np.asarray(centers); radii=np.asarray(radii)
+    if not len(centers): raise ValueError('empty mapped CFPU cover')
+    centers=jnp.stack(centers); radii=jnp.stack(radii)
     if cover is not None:
         # Controlled density comparisons reuse the complete accepted ambient
         # cover, including any minimum-site growth, rather than changing it.
         if parents!=[tuple(p) for p in cover.diagnostics['parent_patches']]:
             raise ValueError('frozen CFPU cover has different parent patches')
-        centers=np.asarray(cover.centers).copy(); radii=np.asarray(cover.radii).copy()
-    if not len(centers): raise ValueError('empty mapped CFPU cover')
+        centers=jnp.array(cover.centers,copy=True); radii=jnp.array(cover.radii,copy=True)
     # Per-piece quadrature has a fixed size (order^(d-1) nodes per piece), independent of the sampling.
-    fine_host=[np.vstack(items) for items in zip(*fine)]
-    coarse_points,coarse_normals=map(lambda items:jnp.asarray(np.vstack(items)),zip(*coarse))
-    fine_points,fine_normals=map(jnp.asarray,fine_host)
-    flux=fine_host[1].sum(axis=0)
-    area=float(np.linalg.norm(fine_host[1],axis=1).sum())
-    if np.linalg.norm(flux)>options.winding_tolerance*area:
+    coarse_points,coarse_normals=map(lambda items:jnp.concatenate(items),zip(*coarse))
+    fine_points,fine_normals=map(lambda items:jnp.concatenate(items),zip(*fine))
+    flux=jnp.sum(fine_normals,axis=0)
+    area=jnp.sum(jnp.linalg.norm(fine_normals,axis=1))
+    if not bool(jnp.isfinite(area)&(area>0.)) or bool(jnp.linalg.norm(flux)>options.winding_tolerance*area):
         raise ValueError('CFPU far-field extension requires a consistently oriented closed boundary')
-    if n<options.min_sites: raise ValueError('CFPU needs more oriented geometry samples')
     p_pad=bucket(len(centers),8)
-    cent_dev=jnp.asarray(pad_rows(centers,p_pad,0.))
-    counts,kth=map(np.asarray,_ball_counts(pts_dev,cent_dev,jnp.asarray(pad_rows(radii,p_pad,0.)),options.min_sites))
+    cent_dev=pad_rows_device(centers,p_pad,0.)
+    counts,kth=_ball_counts(pts_dev,cent_dev,pad_rows_device(radii,p_pad,0.),options.min_sites)
     counts,kth=counts[:len(centers)],kth[:len(centers)]
     initial_radii=radii.copy()
-    short=np.flatnonzero(counts<options.min_sites)
-    if len(short):
+    short=counts<options.min_sites
+    if bool(jnp.any(short)):
         if cover is not None: raise ValueError('frozen CFPU cover has insufficient fit sites')
-        required=1.01*kth[short]
-        if np.any(required>options.max_support_growth*radii[short]):
+        required=1.01*kth
+        if bool(jnp.any(short&(required>options.max_support_growth*radii))):
             raise ValueError('CFPU minimum-site growth exceeds its bound; refine the shared geometry/data')
-        radii[short]=np.maximum(radii[short],required)
-        counts=np.asarray(_ball_counts(pts_dev,cent_dev,jnp.asarray(pad_rows(radii,p_pad,0.)),options.min_sites)[0])[:len(centers)]
-    if np.any((counts<options.min_sites)|(counts>options.max_sites)):
-        flagged=[parents[i] for i in np.flatnonzero(counts>options.max_sites)]
+        radii=jnp.where(short,jnp.maximum(radii,required),radii)
+        counts=_ball_counts(pts_dev,cent_dev,pad_rows_device(radii,p_pad,0.),options.min_sites)[0][:len(centers)]
+    if bool(jnp.any((counts<options.min_sites)|(counts>options.max_sites))):
+        # Parent ids/counts are explicit exception metadata, never numerical inputs.
+        flagged=[parents[i] for i in range(len(parents)) if bool(counts[i]>options.max_sites)]
         raise CFPUCoverError('CFPU supports need shared geometry refinement or more data: '+str(counts.tolist()),flagged)
-    rad_dev=jnp.asarray(pad_rows(radii,p_pad,1.))
+    rad_dev=pad_rows_device(radii,p_pad,1.)
     min_weight=float(jnp.min(_ball_coverage(pts_dev,cent_dev,jnp.where(jnp.arange(p_pad)<len(centers),rad_dev,0.))[:n]))
     if min_weight<=1e-12: raise ValueError('mapped CFPU cover misses boundary samples; refine/inflate the shared geometry cover')
     capacity=bucket(int(counts.max()),1)
@@ -611,15 +631,16 @@ def build_cfpu(segments,points,normals,*,options=CFPUOptions(),cover=None):
     # Group by capacity: a small planar fit must not inherit the cap's largest
     # dense saddle size. One batched solve per power-of-two bucket, chunked only
     # by a device-memory budget.
-    capacities=np.array([bucket(int(k),1) for k in counts])
+    capacities=_site_capacities(counts)
     c=jnp.zeros_like(sites); b=jnp.zeros((len(centers),dim))
     residual=jnp.zeros((len(centers),capacity)); constant=jnp.zeros(len(centers))
-    for size in np.unique(capacities):
-        group=np.flatnonzero(capacities==size)
+    for size in (1<<power for power in range(capacity.bit_length())):
+        group=compact_rows(capacities==size,jnp.arange(len(centers),dtype=jnp.int32))
+        if not len(group): continue
         per=12*((int(size)*dim+dim)**2+int(size)**2*dim*dim)*8
         batch=bucket(max(1,min(len(group),(3<<30)//per)),1)
         for start in range(0,len(group),batch):
-            g=jnp.asarray(pad_rows(group[start:start+batch],batch,len(centers)))
+            g=pad_rows_device(group[start:start+batch],batch,len(centers))
             sc,sb,sr,sk=_local_solve(*_solve_data(sites,values,mask,g,int(size)))
             c,b,residual,constant=_put_solve(c,b,residual,constant,g,sc,sb,sr,sk)
     if not _all_finite(c,b,residual,constant):
@@ -643,7 +664,7 @@ def build_cfpu(segments,points,normals,*,options=CFPUOptions(),cover=None):
     model.diagnostics=dict(patch_count=len(centers),parent_patches=parents,support_counts=counts.tolist(),
         padded_capacity=capacity,max_active=max_active,min_boundary_weight=min_weight,
         solve_capacities=capacities.tolist(),overlap_bound='per-point overlap counts (grouped evaluation)',
-        max_boundary_residual=max_residual,net_flux_relative=float(np.linalg.norm(flux)/area),
+        max_boundary_residual=max_residual,net_flux_relative=float(jnp.linalg.norm(flux)/area),
         quadrature_orders=[options.quadrature_order,2*options.quadrature_order],options=vars(options),
         farfield='checked boundary flux quadrature; no global CFI fallback',inverse_map_solves=False,
         support_growth=(radii/initial_radii).tolist(),

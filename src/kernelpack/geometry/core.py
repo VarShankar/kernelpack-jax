@@ -1417,7 +1417,7 @@ class EmbeddedSurface:
             validation_parameters=validation_parameters,validation_positions=validation_positions,
             validation_normals=validation_normals,options=options or PUOptions(),
             initial_cells=initial_cells,
-            parameter_bounds=None if outlines is None else (np.asarray(outlines[0]).min(axis=0),np.asarray(outlines[0]).max(axis=0)))
+            parameter_bounds=None if outlines is None else (jnp.asarray(outlines[0]).min(axis=0),jnp.asarray(outlines[0]).max(axis=0)))
         self.geom_model=dict(type="parametric-pu",degree=3,model=model,
             polynomial_basis_terms=self.surf_dim+1,input_parameters=jnp.asarray(parameters),
             outlines=outlines,normal_sign=1.)
@@ -1690,7 +1690,8 @@ class PiecewiseSmoothEmbeddedSurface:
             sites = [jnp.asarray(sites_of(seg), dtype=float) for seg in self.segments]
             xb = jnp.concatenate(sites)
             nr = jnp.concatenate([jnp.asarray(normals_of(seg), dtype=float) for seg in self.segments])
-            seg_map = np.repeat(np.arange(len(sites)), [x.shape[0] for x in sites])
+            seg_map = jnp.concatenate([jnp.full(x.shape[0],index,dtype=jnp.int32)
+                                       for index,x in enumerate(sites)])
             # Samples on the pieces have priority 0; features come first (below).
             return xb, nr, seg_map, jnp.zeros(xb.shape[0], dtype=float)
 
@@ -1719,7 +1720,7 @@ class PiecewiseSmoothEmbeddedSurface:
             feature_normals = normals[order] / row_norm(normals[order])[:, None]
             xb = jnp.concatenate([features[order], xb])
             nr = jnp.concatenate([feature_normals, nr])
-            segment_map = np.concatenate([np.full(n_features, -1, dtype=int), segment_map])
+            segment_map = jnp.concatenate([jnp.full(n_features,-1,dtype=jnp.int32),segment_map])
             corner = jnp.concatenate([priorities[order].astype(float), corner])
         keep = _assembled_boundary_keep_mask(xb, corner, float(radius))
         self.xb, self.nrmls, self.corner_flags = compact_rows(keep, xb, nr, corner)
@@ -1771,7 +1772,7 @@ class PiecewiseSmoothEmbeddedSurface:
                         indices={patch for p,patch in error.parent_patches if p==piece}
                         if model['type']=='spherical-pu':
                             from .spherical_pu import split_caps
-                            pu=model['model']; cover=split_caps(np.asarray(pu.centers),np.asarray(pu.betas),indices)
+                            pu=model['model']; cover=split_caps(pu.centers,pu.betas,indices)
                             sign=model.get('normal_sign',1.); context=model['fit_context']
                             segment.build_spherical_pu_model(model['data'],initial_cover=cover,**context)
                             if sign<0: segment.flip_normals()

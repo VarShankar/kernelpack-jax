@@ -7,6 +7,7 @@ The caller supplies a valid parametrization and its physical trimming curves.
 from dataclasses import dataclass, field
 from functools import partial
 from itertools import product
+import math
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -33,10 +34,10 @@ class PUFitError(ValueError):
 
 def rectangular_cover(lower,upper,grid=2):
     """Common initial parameter cover for PU maps and exact affine pieces."""
-    lower,upper=np.asarray(lower),np.asarray(upper)
-    axes=[np.linspace(a,b,grid+1) for a,b in zip(lower,upper)]
-    return [(np.array([axes[k][i] for k,i in enumerate(index)]),
-             np.array([axes[k][i+1] for k,i in enumerate(index)]))
+    lower,upper=jnp.asarray(lower),jnp.asarray(upper)
+    axes=[jnp.linspace(a,b,grid+1) for a,b in zip(lower,upper)]
+    return [(jnp.array([axes[k][i] for k,i in enumerate(index)]),
+             jnp.array([axes[k][i+1] for k,i in enumerate(index)]))
             for index in product(range(grid),repeat=len(lower))]
 
 
@@ -45,10 +46,10 @@ def refine_cover_cells(cells,indices):
     result=[]
     for index,(lower,upper) in enumerate(cells):
         if index not in indices: result.append((lower,upper)); continue
-        middle=(np.asarray(lower)+np.asarray(upper))/2
+        middle=(jnp.asarray(lower)+jnp.asarray(upper))/2
         for bits in product((0,1),repeat=len(lower)):
-            bits=np.asarray(bits,bool)
-            result.append((np.where(bits,middle,lower),np.where(bits,upper,middle)))
+            bits=jnp.asarray(bits,bool)
+            result.append((jnp.where(bits,middle,lower),jnp.where(bits,upper,middle)))
     return result
 
 
@@ -358,47 +359,43 @@ def _put_fits(weights,poly,origins,g,w,pc,o):
 
 
 def _build(parameters,positions,cells,offset,scale,options):
-    """Device memberships and batched local fits, grouped by support size."""
-    from kernelpack.accelerators.jax_spatial import bucket,pad_rows
+    """Device memberships, ranks and local solves; only cover topology is host metadata."""
+    from kernelpack.accelerators.jax_spatial import bucket
+    parameters=jnp.asarray(parameters,dtype=float); positions=jnp.asarray(positions,dtype=float)
     normalized=(parameters-offset)/scale
-    centers=np.array([(lo+hi)/2 for lo,hi in cells])
-    widths=np.array([(hi-lo)*options.overlap/2 for lo,hi in cells])
+    centers=jnp.stack([(jnp.asarray(lo)+jnp.asarray(hi))/2 for lo,hi in cells])
+    widths=jnp.stack([(jnp.asarray(hi)-jnp.asarray(lo))*options.overlap/2 for lo,hi in cells])
     p_pad=bucket(len(cells),8); n_pad=bucket(len(normalized),64)
-    # Padding supports have zero width (no members); padding sites lie far away.
-    far=np.full(normalized.shape[1],1e300)
-    norm_dev=jnp.asarray(pad_rows(normalized,n_pad,0.)+np.where(np.arange(n_pad)[:,None]<len(normalized),0.,far))
-    cent_dev=jnp.asarray(pad_rows(centers,p_pad,0.)); wid_dev=jnp.asarray(pad_rows(widths,p_pad,0.))
-    counts=np.asarray(_rect_member_counts(norm_dev,cent_dev,wid_dev))[:len(cells)]
-    nonempty=counts>0  # Entire support may lie outside the trimmed face.
-    if not nonempty.any(): raise ValueError('PU cover contains no geometry data')
-    capacity=bucket(int(counts.max()),1)
+    norm_dev=pad_device(normalized,n_pad).at[len(normalized):].set(1e300)
+    cent_dev=pad_device(centers,p_pad); wid_dev=pad_device(widths,p_pad)
+    counts=_rect_member_counts(norm_dev,cent_dev,wid_dev)[:len(cells)]
+    nonempty=counts>0
+    if not bool(jnp.any(nonempty)): raise ValueError('PU cover contains no geometry data')
+    capacity=bucket(int(jnp.max(counts)),1)
     ids,_,local,valid=_rect_members(norm_dev,cent_dev,wid_dev,capacity)
-    ranks=np.asarray(_affine_ranks(local,valid))[:len(cells)]
-    bad=np.flatnonzero(nonempty&((counts<options.min_sites)|(ranks<normalized.shape[1]+1)))
-    if len(bad):
-        cell=int(bad[0]); raise ValueError(f'PU support needs more geometry data: patch {cell}, sites {int(counts[cell])}')
-    usable=np.flatnonzero(nonempty)
-    centers=centers[usable]; widths=widths[usable]; cells=[cells[i] for i in usable]
+    ranks=_affine_ranks(local,valid)[:len(cells)]
+    bad=nonempty&((counts<options.min_sites)|(ranks<normalized.shape[1]+1))
+    if bool(jnp.any(bad)):
+        cell=int(jnp.argmax(bad)); raise ValueError(f'PU support needs more geometry data: patch {cell}, sites {int(counts[cell])}')
+    # One scalar per support controls the Python cover list; fit arrays never leave the device.
+    selected=[i for i in range(len(cells)) if bool(nonempty[i])]
+    usable=jnp.asarray(selected,dtype=jnp.int32)
+    centers=centers[usable]; widths=widths[usable]; cells=[cells[i] for i in selected]
     counts=counts[usable]
-    u=jnp.asarray(usable)
-    sites,active,values=_usable_data(local,valid,ids,jnp.asarray(positions,dtype=float),u)
-    # Bucket supports by their own power-of-two size; one batched solve per bucket,
-    # chunked only by a device-memory budget.
+    sites,active,values=_usable_data(local,valid,ids,positions,usable)
     weights=jnp.zeros(sites.shape[:2]+(positions.shape[1],)); poly=jnp.zeros((len(cells),sites.shape[2]+1,positions.shape[1]))
     origins=jnp.zeros((len(cells),positions.shape[1]))
-    sizes=np.array([bucket(c,8) for c in counts])
-    for size in np.unique(sizes):
-        group=np.flatnonzero(sizes==size)
-        per=(int(size)+sites.shape[2]+1)**2*8*4
-        batch=bucket(max(1,min(len(group),(1<<31)//per)),1)
-        for start in range(0,len(group),batch):
-            g=group[start:start+batch]; gi=jnp.asarray(pad_rows(g,batch,len(cells)))
-            w,pc,o=_solve_local_fits(*_bucket_data(sites,values,active,gi,len(g),int(size)))
+    for size,count,group in device_groups(jnp.maximum(counts,8)):
+        per=(size+sites.shape[2]+1)**2*8*4
+        batch=bucket(max(1,min(count,(1<<31)//per)),1)
+        for start in range(0,count,batch):
+            amount=min(batch,count-start)
+            gi=pad_device(group[start:start+amount],batch,len(cells))
+            w,pc,o=_solve_local_fits(*_bucket_data(sites,values,active,gi,amount,size))
             weights,poly,origins=_put_fits(weights,poly,origins,gi,w,pc,o)
     if not bool(jnp.all(jnp.isfinite(weights))): raise ValueError('nonfinite PU geometry fit')
-    model=ParametricPUModel(sites,weights,poly,origins,jnp.asarray(centers),
-        jnp.asarray(widths),jnp.asarray(offset),jnp.asarray(scale),len(cells),cells)
-    model.diagnostics=dict(patch_count=len(cells),support_counts=counts.tolist(),
+    model=ParametricPUModel(sites,weights,poly,origins,centers,widths,jnp.asarray(offset),jnp.asarray(scale),len(cells),cells)
+    model.diagnostics=dict(patch_count=len(cells),support_counts=[int(c) for c in counts],
         padded_capacity=capacity,max_active=model.max_active,kernel='r^3 + Pi_1',
         evaluation='grouped by overlap count; max_active is the patch count (always valid)')
     return model
@@ -413,77 +410,82 @@ def fit_parametric_pu(parameters,positions,*,validation_parameters=None,
     estimates accuracy; it does not certify unseen geometry. Separate samples
     are preferred when the input geometry can supply them.
     """
-    parameters=np.asarray(parameters,float); positions=np.asarray(positions,float)
+    parameters=jnp.asarray(parameters,float); positions=jnp.asarray(positions,float)
     if (parameters.ndim!=2 or parameters.shape[1] not in (1,2)
             or positions.shape!=(len(parameters),parameters.shape[1]+1)
-            or not np.isfinite(parameters).all() or not np.isfinite(positions).all()):
+            or not jnp.isfinite(parameters).all() or not jnp.isfinite(positions).all()):
         raise ValueError('finite parameters and matching physical coordinate data are required')
-    if (len(np.unique(parameters,axis=0))!=len(parameters)
+    if (bool(jnp.any(jnp.all(jnp.diff(parameters[jnp.lexsort(tuple(parameters[:,i] for i in reversed(range(parameters.shape[1]))))],axis=0)==0,axis=1)))
             or options.initial_grid<1 or not 1<options.overlap<2
             or options.relative_position_tolerance<=0 or options.normal_tolerance<=0
             or options.min_sites<parameters.shape[1]+2 or options.max_refinements<0
             or not 0<options.min_jacobian_ratio<1
-            or not np.isfinite([options.overlap,options.relative_position_tolerance,
-                options.normal_tolerance,options.min_jacobian_ratio]).all()):
+            or not all(math.isfinite(value) for value in (
+                options.overlap, options.relative_position_tolerance,
+                options.normal_tolerance, options.min_jacobian_ratio))):
         raise ValueError('invalid PU data or options')
     if len(parameters)<options.min_sites:
         raise ValueError('PU support needs more geometry data')
-    lower,upper=(parameters.min(axis=0),parameters.max(axis=0)) if parameter_bounds is None else map(np.asarray,parameter_bounds)
+    lower,upper=(parameters.min(axis=0),parameters.max(axis=0)) if parameter_bounds is None else map(jnp.asarray,parameter_bounds)
     if (lower.shape!=(parameters.shape[1],) or upper.shape!=lower.shape
-            or not np.isfinite(lower).all() or not np.isfinite(upper).all()):
+            or not jnp.isfinite(lower).all() or not jnp.isfinite(upper).all()):
         raise ValueError('invalid parameter bounds')
     offset=(upper+lower)/2
     scale=(upper-lower)/2
-    if np.any(scale<=0): raise ValueError('parameter data do not span a parameter domain')
-    length=2*np.linalg.norm(positions-positions.mean(axis=0),axis=1).max()
+    if jnp.any(scale<=0): raise ValueError('parameter data do not span a parameter domain')
+    length=float(2*jnp.linalg.norm(positions-positions.mean(axis=0),axis=1).max())
+    if not length>0:
+        raise ValueError('geometry data must have nonzero physical extent')
     tolerance=options.relative_position_tolerance*length
     if validation_parameters is None:
         if validation_positions is not None or validation_normals is not None:
             raise ValueError('validation parameters are required')
-        check=np.arange(2,len(parameters),5)
-        train=np.setdiff1d(np.arange(len(parameters)),check)
+        check=jnp.arange(2,len(parameters),5)
+        train=jnp.asarray([i for i in range(len(parameters)) if i<2 or (i-2)%5],dtype=jnp.int32)
         vp,vx=parameters[check],positions[check]
         fit_parameters,fit_positions=parameters[train],positions[train]
         validation_kind='heldout_data_sites'
     else:
-        vp=np.asarray(validation_parameters,float); vx=np.asarray(validation_positions,float)
+        vp=jnp.asarray(validation_parameters,float); vx=jnp.asarray(validation_positions,float)
         fit_parameters,fit_positions=parameters,positions
         validation_kind='separate_geometry_samples'
     if (vp.ndim!=2 or vp.shape[1]!=parameters.shape[1] or vx.shape!=(len(vp),positions.shape[1])
-            or not len(vp) or not np.isfinite(vp).all() or not np.isfinite(vx).all()):
+            or not len(vp) or not jnp.isfinite(vp).all() or not jnp.isfinite(vx).all()):
         raise ValueError('finite matching geometry validation arrays are required')
     if validation_parameters is not None:
-        from scipy.spatial import cKDTree
-        nearest=cKDTree(parameters).query(vp)[0]
-        if np.all(nearest<=1e-12*np.max(scale)):
+        from kernelpack.domain.stencils import select_stencils
+        _,nearest_points,valid=select_stencils(parameters,vp,k=1)
+        if not bool(jnp.all(valid)): raise ValueError('invalid validation parameter geometry')
+        nearest=jnp.linalg.norm(nearest_points[:,0]-vp,axis=1)
+        if jnp.all(nearest<=1e-12*jnp.max(scale)):
             raise ValueError('validation must include samples outside the interpolation sites')
-    vn=None if validation_normals is None else np.asarray(validation_normals,float)
+    vn=None if validation_normals is None else jnp.asarray(validation_normals,float)
     if vn is not None:
-        if vn.shape!=vx.shape or not np.isfinite(vn).all() or np.any(np.linalg.norm(vn,axis=1)==0):
+        if vn.shape!=vx.shape or not jnp.isfinite(vn).all() or jnp.any(jnp.linalg.norm(vn,axis=1)==0):
             raise ValueError('finite nonzero validation normals must match positions')
-        vn=vn/np.linalg.norm(vn,axis=1)[:,None]
-    cells=rectangular_cover(-np.ones(parameters.shape[1]),np.ones(parameters.shape[1]),options.initial_grid) if initial_cells is None else initial_cells
-    history=[]; best_score=np.inf
+        vn=vn/jnp.linalg.norm(vn,axis=1)[:,None]
+    cells=rectangular_cover(-jnp.ones(parameters.shape[1]),jnp.ones(parameters.shape[1]),options.initial_grid) if initial_cells is None else initial_cells
+    history=[]; best_score=float("inf")
     for refinement in range(options.max_refinements+1):
         if len(cells)>options.max_patches: raise ValueError('PU refinement exceeded max_patches')
         try: model=_build(fit_parameters,fit_positions,cells,offset,scale,options)
         except ValueError as error:
             raise PUFitError(str(error),history) from error
-        prediction=np.asarray(model.evaluate(vp)); jac,nr=model.frame(vp)
-        jac,nr=np.asarray(jac),np.asarray(nr)
-        error=np.linalg.norm(prediction-vx,axis=1)
-        singular=np.linalg.svd(np.nan_to_num(jac),compute_uv=False)
-        regular=np.isfinite(jac).all(axis=(1,2)) & np.isfinite(nr).all(axis=1)
-        regular &= singular[:,-1]>options.min_jacobian_ratio*np.maximum(singular[:,0],1e-300)
-        normal_error=np.zeros(len(vp)) if vn is None else np.linalg.norm(nr-vn,axis=1)
-        failed=(error>tolerance)|(normal_error>options.normal_tolerance)|(~regular)|(~np.isfinite(error))
-        ratio=float(np.min(singular[:,-1]/np.maximum(singular[:,0],1e-300)))
+        prediction=jnp.asarray(model.evaluate(vp)); jac,nr=model.frame(vp)
+        jac,nr=jnp.asarray(jac),jnp.asarray(nr)
+        error=jnp.linalg.norm(prediction-vx,axis=1)
+        singular=jnp.linalg.svd(jnp.nan_to_num(jac),compute_uv=False)
+        regular=jnp.isfinite(jac).all(axis=(1,2)) & jnp.isfinite(nr).all(axis=1)
+        regular &= singular[:,-1]>options.min_jacobian_ratio*jnp.maximum(singular[:,0],1e-300)
+        normal_error=jnp.zeros(len(vp)) if vn is None else jnp.linalg.norm(nr-vn,axis=1)
+        failed=(error>tolerance)|(normal_error>options.normal_tolerance)|(~regular)|(~jnp.isfinite(error))
+        ratio=float(jnp.min(singular[:,-1]/jnp.maximum(singular[:,0],1e-300)))
         score=max(float(error.max())/tolerance,float(normal_error.max())/options.normal_tolerance,
                   options.min_jacobian_ratio/max(ratio,1e-300))
-        if not np.isfinite(error).all() or not np.isfinite(normal_error).all(): score=np.inf
+        if not jnp.isfinite(error).all() or not jnp.isfinite(normal_error).all(): score=float("inf")
         history.append(dict(refinement=refinement,patch_count=len(model.cells),
             max_position_error=float(error.max()),max_normal_error=None if vn is None else float(normal_error.max()),
-            min_jacobian_ratio=ratio,indicator_score=None if not np.isfinite(score) else score,
+            min_jacobian_ratio=ratio,indicator_score=None if not jnp.isfinite(score) else score,
             failed_samples=int(failed.sum())))
         if not failed.any():
             if validation_parameters is None: model=_build(parameters,positions,model.cells,offset,scale,options)
@@ -501,11 +503,11 @@ def fit_parametric_pu(parameters,positions,*,validation_parameters=None,
         refined=[]
         for lo,hi in model.cells:
             center=(lo+hi)/2; width=(hi-lo)*options.overlap/2
-            if np.any(failed & np.all(np.abs(z-center)<width,axis=1)):
+            if jnp.any(failed & jnp.all(jnp.abs(z-center)<width,axis=1)):
                 mid=(lo+hi)/2
                 for bits in product((0,1),repeat=parameters.shape[1]):
-                    bits=np.asarray(bits,bool)
-                    refined.append((np.where(bits,mid,lo),np.where(bits,hi,mid)))
+                    bits=jnp.asarray(bits,bool)
+                    refined.append((jnp.where(bits,mid,lo),jnp.where(bits,hi,mid)))
             else: refined.append((lo,hi))
         cells=refined
 

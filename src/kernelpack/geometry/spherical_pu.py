@@ -35,7 +35,7 @@ map; for directions about c this is out of the enclosed region.
 from dataclasses import dataclass, field
 from functools import partial
 
-import numpy as np
+import math
 import jax
 import jax.numpy as jnp
 from jax import jit, lax
@@ -57,33 +57,33 @@ class SphericalPUOptions:
 # ---------------------------------------------------------------- sphere helpers
 def latlong_to_directions(latlong):
     """Unit vectors from (latitude, longitude) in radians, (n, 2) -> (n, 3); angles (n,) or (n, 1) -> (n, 2)."""
-    a = np.asarray(latlong, float)
+    a = jnp.asarray(latlong, float)
     if a.ndim == 1 or a.shape[1] == 1:
         t = a.reshape(-1)
-        return np.column_stack([np.cos(t), np.sin(t)])
+        return jnp.column_stack([jnp.cos(t), jnp.sin(t)])
     lat, lon = a[:, 0], a[:, 1]
-    return np.column_stack([np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)])
+    return jnp.column_stack([jnp.cos(lat) * jnp.cos(lon), jnp.cos(lat) * jnp.sin(lon), jnp.sin(lat)])
 
 
 def directions_about(positions, center):
     """Unit directions (y - c)/|y - c| of the samples about the center."""
-    s = np.asarray(positions, float) - np.asarray(center, float)
-    r = np.linalg.norm(s, axis=1)
-    if np.any(r == 0):
+    s = jnp.asarray(positions, float) - jnp.asarray(center, float)
+    r = jnp.linalg.norm(s, axis=1)
+    if jnp.any(r == 0):
         raise ValueError("a sample coincides with the center")
     return s / r[:, None]
 
 
 def tangent_basis(c):
     """Orthonormal tangent basis E (rows) at unit vectors c: (m, d-1, d), with (e_1, e_2, c) right handed."""
-    c = np.asarray(c, float)
+    c = jnp.asarray(c, float)
     if c.shape[1] == 2:
-        return np.stack([-c[:, 1], c[:, 0]], axis=1)[:, None, :]
-    a = np.eye(3)[np.argmin(np.abs(c), axis=1)]
-    t1 = a - np.sum(a * c, axis=1, keepdims=True) * c
-    t1 /= np.linalg.norm(t1, axis=1, keepdims=True)
-    t2 = np.cross(c, t1)
-    return np.stack([t1, t2], axis=1)
+        return jnp.stack([-c[:, 1], c[:, 0]], axis=1)[:, None, :]
+    a = jnp.eye(3)[jnp.argmin(jnp.abs(c), axis=1)]
+    t1 = a - jnp.sum(a * c, axis=1, keepdims=True) * c
+    t1 = t1 / jnp.linalg.norm(t1, axis=1, keepdims=True)
+    t2 = jnp.cross(c, t1)
+    return jnp.stack([t1, t2], axis=1)
 
 
 def _tangent_basis_point(u):
@@ -99,59 +99,73 @@ def _tangent_basis_point(u):
 def initial_caps(dim):
     """Centers and covering radii of the initial cover of S^{d-1}."""
     if dim == 2:
-        centers = np.array([[1., 0.], [0., 1.], [-1., 0.], [0., -1.]])
-        return centers, np.full(4, np.pi / 4)
-    g = (1 + np.sqrt(5)) / 2
+        centers = jnp.array([[1., 0.], [0., 1.], [-1., 0.], [0., -1.]])
+        return centers, jnp.full(4, jnp.pi / 4)
+    g = (1 + jnp.sqrt(5)) / 2
     v = []
     for a in (-1., 1.):
         for b in (-g, g):
             v += [(0., a, b), (a, b, 0.), (b, 0., a)]
-    v = np.asarray(v)
-    v /= np.linalg.norm(v, axis=1, keepdims=True)
+    v = jnp.asarray(v)
+    v = v / jnp.linalg.norm(v, axis=1, keepdims=True)
     # covering radius: angle from a vertex to the centroid of an incident face (all faces are equal)
     i = 0
-    nbr = np.argsort(v @ v[i])[::-1][1:6]
+    nbr = jnp.argsort(v @ v[i])[::-1][1:6]
     j = nbr[0]
-    k = [m for m in nbr[1:] if v[m] @ v[j] > .4][0]
-    centroid = (v[i] + v[j] + v[k]) / np.linalg.norm(v[i] + v[j] + v[k])
-    beta = np.arccos(np.clip(centroid @ v[i], -1, 1))
-    return v, np.full(len(v), beta * (1 + 1e-6))
+    k = nbr[1:][jnp.argmax((v[nbr[1:]] @ v[j]) > .4)]
+    centroid = (v[i] + v[j] + v[k]) / jnp.linalg.norm(v[i] + v[j] + v[k])
+    beta = jnp.arccos(jnp.clip(centroid @ v[i], -1, 1))
+    return v, jnp.full(len(v), beta * (1 + 1e-6))
 
 
 def split_caps(centers, betas, indices):
     """Replace the caps in indices by caps of half the covering radius (see the module docstring)."""
-    centers, betas = np.asarray(centers, float), np.asarray(betas, float)
+    centers, betas = jnp.asarray(centers, float), jnp.asarray(betas, float)
     out_c, out_b = [], []
     for i, (c, b) in enumerate(zip(centers, betas)):
         if i not in indices:
-            out_c.append(c[None]); out_b.append([b]); continue
+            out_c.append(c[None]); out_b.append(b[None]); continue
         if len(c) == 2:
             t = tangent_basis(c[None])[0, 0]
-            kids = np.array([np.cos(b / 2) * c + s * np.sin(b / 2) * t for s in (-1., 1.)])
+            kids = jnp.array([jnp.cos(b / 2) * c + s * jnp.sin(b / 2) * t for s in (-1., 1.)])
         else:
             e1, e2 = tangent_basis(c[None])[0]
-            d = np.sqrt(3) / 2 * b
-            ring = [np.cos(d) * c + np.sin(d) * (np.cos(th) * e1 + np.sin(th) * e2)
-                    for th in np.arange(6) * np.pi / 3]
-            kids = np.vstack([c[None], ring])
-        out_c.append(kids / np.linalg.norm(kids, axis=1, keepdims=True)); out_b.append(np.full(len(kids), b / 2))
-    return np.vstack(out_c), np.concatenate(out_b)
+            d = jnp.sqrt(3) / 2 * b
+            ring = [jnp.cos(d) * c + jnp.sin(d) * (jnp.cos(th) * e1 + jnp.sin(th) * e2)
+                    for th in jnp.arange(6) * jnp.pi / 3]
+            kids = jnp.vstack([c[None], jnp.stack(ring)])
+        out_c.append(kids / jnp.linalg.norm(kids, axis=1, keepdims=True)); out_b.append(jnp.full(len(kids), b / 2))
+    return jnp.vstack(out_c), jnp.concatenate(out_b)
+
+
+@partial(jit, static_argnames=("order",))
+def gauss_legendre(order):
+    """Gauss--Legendre rule by the symmetric Jacobi eigensystem on the device."""
+    index = jnp.arange(1, order, dtype=jnp.float64)
+    off = index / jnp.sqrt(4*index*index-1)
+    jacobi = jnp.diag(off, 1) + jnp.diag(off, -1)
+    nodes, vectors = jnp.linalg.eigh(jacobi)
+    return nodes, 2*vectors[0]**2
 
 
 def sphere_quadrature(dim, order):
     """Product quadrature on S^{d-1}: Gauss-Legendre in u_3 times the trapezoidal rule in longitude (d = 3),
     or the trapezoidal rule with 4 * order points (d = 2). Returns unit vectors and weights (sum = |S^{d-1}|)."""
+    if dim not in (2,3) or order<1:
+        raise ValueError("positive quadrature order and dimension2 or3 required")
     if dim == 2:
         n = 4 * order
-        t = 2 * np.pi * np.arange(n) / n
-        return np.column_stack([np.cos(t), np.sin(t)]), np.full(n, 2 * np.pi / n)
-    z, wz = np.polynomial.legendre.leggauss(order)
+        t = 2 * jnp.pi * jnp.arange(n) / n
+        return jnp.column_stack([jnp.cos(t), jnp.sin(t)]), jnp.full(n, 2 * jnp.pi / n)
+    if dim != 3 or order < 1:
+        raise ValueError("positive quadrature order and dimension2 or3 required")
+    z, wz = gauss_legendre(order)
     n = 2 * order
-    lon = 2 * np.pi * (np.arange(n) + .5) / n
-    zz, ll = np.meshgrid(z, lon, indexing="ij")
-    rho = np.sqrt(1 - zz ** 2)
-    u = np.stack([rho * np.cos(ll), rho * np.sin(ll), zz], axis=-1).reshape(-1, 3)
-    w = (wz[:, None] * np.full(n, 2 * np.pi / n)[None, :]).ravel()
+    lon = 2 * jnp.pi * (jnp.arange(n) + .5) / n
+    zz, ll = jnp.meshgrid(z, lon, indexing="ij")
+    rho = jnp.sqrt(1 - zz ** 2)
+    u = jnp.stack([rho * jnp.cos(ll), rho * jnp.sin(ll), zz], axis=-1).reshape(-1, 3)
+    w = (wz[:, None] * jnp.full(n, 2 * jnp.pi / n)[None, :]).ravel()
     return u, w
 
 
@@ -239,7 +253,7 @@ class SphericalPUModel:
     bases: object        # (m, d-1, d) tangent bases E_j
     tans: object         # (m,) tan(alpha_j)
     chords: object       # (m,) 2 sin(alpha_j / 2)
-    betas: np.ndarray    # (m,) covering radii
+    betas: jnp.ndarray    # (m,) covering radii
     diagnostics: dict = field(default_factory=dict)
 
     @property
@@ -250,37 +264,36 @@ class SphericalPUModel:
         return (self.sites, self.weights, self.poly_coeffs, self.origins, self.centers, self.bases, self.tans, self.chords)
 
     def _grouped(self, u, frame=False):
-        from kernelpack.accelerators.jax_spatial import bucket, pad_rows
-        u = np.asarray(u, float)
-        u = u / np.linalg.norm(u, axis=1, keepdims=True)
+        from kernelpack.accelerators.jax_spatial import bucket
+        from .parametric_pu import device_groups, pad_device, take_rows, put_rows
+        u = jnp.asarray(u, dtype=float)
+        u = u / jnp.linalg.norm(u, axis=1, keepdims=True)
         n, d = u.shape
         m = int(self.centers.shape[0])
         if n == 0:
-            return (jnp.zeros((0, d, d - 1)), jnp.zeros((0, d))) if frame else jnp.zeros((0, d))
+            return (jnp.zeros((0,d,d-1)),jnp.zeros((0,d))) if frame else jnp.zeros((0,d))
         n_pad = bucket(n)
-        chunk = 1 << int(np.floor(np.log2(min(n_pad, max(64, (1 << 22) // max(1, m))))))
-        pad = pad_rows(u, n_pad, 0.)
-        pad[n:, 0] = 1.
-        counts = np.asarray(_overlap_counts(jnp.asarray(pad), self.centers, self.chords, chunk))[:n]
-        if np.any(counts == 0):
+        chunk = 1 << (max(1,min(n_pad,max(64,(1<<22)//max(1,m)))).bit_length()-1)
+        # A valid unit vector pads every group; out-of-range output rows are dropped.
+        pad = pad_device(u,n_pad).at[n:,0].set(1.)
+        counts = _overlap_counts(pad,self.centers,self.chords,chunk)[:n]
+        if bool(jnp.any(counts==0)):
             raise ValueError("spherical PU cover misses parameter points")
-        widths = 1 << np.ceil(np.log2(np.maximum(counts, 1))).astype(np.int64)
         if frame:
-            jac = np.empty((n, d, d - 1)); nr = np.empty((n, d))
+            jac=jnp.zeros((n,d,d-1)); nr=jnp.zeros((n,d))
         else:
-            out = np.empty((n, d))
-        for w in np.unique(widths):
-            ids = np.flatnonzero(widths == w); w = int(min(w, m))
-            sub = pad_rows(u[ids], bucket(len(ids)), 0.)
-            sub[len(ids):, 0] = 1.
-            per = max(1, w * int(self.sites.shape[1]) * 4)
-            batch = int(min(len(sub), max(1, 1 << int(np.floor(np.log2(max(1, (1 << 25) // per)))))))
+            out=jnp.zeros((n,d))
+        for width,count,ids in device_groups(counts):
+            width=min(width,m)
+            sub=take_rows(u,ids).at[count:,0].set(1.)
+            per=max(1,width*int(self.sites.shape[1])*4)
+            batch=min(len(sub),1 << (max(1,(1<<25)//per).bit_length()-1))
             if frame:
-                j, v = _grouped_frame(jnp.asarray(sub), w, *self._args(), max(1, batch // 4))
-                jac[ids] = np.asarray(j)[:len(ids)]; nr[ids] = np.asarray(v)[:len(ids)]
+                j,v=_grouped_frame(sub,width,*self._args(),max(1,batch//4))
+                jac=put_rows(jac,ids,j); nr=put_rows(nr,ids,v)
             else:
-                out[ids] = np.asarray(_grouped_evaluate(jnp.asarray(sub), w, *self._args(), batch))[:len(ids)]
-        return (jnp.asarray(jac), jnp.asarray(nr)) if frame else jnp.asarray(out)
+                out=put_rows(out,ids,_grouped_evaluate(sub,width,*self._args(),batch))
+        return (jac,nr) if frame else out
 
     def evaluate(self, directions):
         """Positions x(u) at unit vectors u (n, d)."""
@@ -298,63 +311,54 @@ class SphericalPUModel:
 
     def cap_mask(self, directions, cap):
         """Membership of unit vectors in the support of one cap."""
-        u = np.asarray(directions, float)
-        c = np.asarray(self.centers)[cap]
-        return np.sum((u - c) ** 2, axis=1) < float(np.asarray(self.chords)[cap]) ** 2
+        u = jnp.asarray(directions, float)
+        c = jnp.asarray(self.centers)[cap]
+        return jnp.sum((u - c) ** 2, axis=1) < float(jnp.asarray(self.chords)[cap]) ** 2
 
 
 def _build(directions, positions, centers, betas, options):
-    """Device memberships and batched local fits, grouped by support size."""
-    from kernelpack.accelerators.jax_spatial import bucket, pad_rows
-    d = directions.shape[1]
-    alphas = options.overlap * betas
-    if np.any(alphas >= np.pi / 2):
+    """Device memberships and local solves, grouped by support capacity."""
+    from kernelpack.accelerators.jax_spatial import bucket
+    from .parametric_pu import pad_device, device_groups, _bucket_data, _put_fits
+    directions=jnp.asarray(directions,dtype=float); positions=jnp.asarray(positions,dtype=float)
+    centers=jnp.asarray(centers,dtype=float); betas=jnp.asarray(betas,dtype=float)
+    d=directions.shape[1]; alphas=options.overlap*betas
+    if bool(jnp.any(alphas>=jnp.pi/2)):
         raise ValueError("spherical PU supports must lie in open hemispheres")
-    chords = 2 * np.sin(alphas / 2)
-    m_pad, n_pad = bucket(len(centers), 8), bucket(len(directions), 64)
-    u_dev = pad_rows(directions, n_pad, 0.)
-    u_dev[len(directions):] = 1e300                                      # padding sites lie far away
-    c_dev = jnp.asarray(pad_rows(centers, m_pad, 0.))
-    r_dev = jnp.asarray(pad_rows(chords, m_pad, 0.))
-    u_dev = jnp.asarray(u_dev)
-    counts = np.asarray(_cap_counts(u_dev, c_dev, r_dev))[:len(centers)]
-    if np.any(counts < options.min_sites):
-        j = int(np.argmin(counts))
-        raise ValueError(f"spherical PU cap needs more geometry data: cap {j}, sites {int(counts[j])}")
-    capacity = bucket(int(counts.max()), 1)
-    ids, _ = _cap_members(u_dev, c_dev, r_dev, capacity)
-    ids = np.asarray(ids)[:len(centers)]
-    active = ids >= 0
-    bases = tangent_basis(centers)
-    tans = np.tan(alphas)
-    member_u = directions[np.maximum(ids, 0)]
-    cos = np.sum(member_u * centers[:, None, :], axis=2)
-    sites = np.einsum("mkd,mnd->mnk", bases, member_u) / np.where(active, cos, 1.)[..., None] / tans[:, None, None]
-    sites = np.where(active[..., None], sites, 0.)
-    rank = np.linalg.matrix_rank(np.concatenate([np.ones(active.shape + (1,)), sites], axis=2) * active[..., None])
-    if np.any(rank < d):
+    chords=2*jnp.sin(alphas/2)
+    m_pad,n_pad=bucket(len(centers),8),bucket(len(directions),64)
+    u_dev=pad_device(directions,n_pad).at[len(directions):].set(1e300)
+    c_dev=pad_device(centers,m_pad); r_dev=pad_device(chords,m_pad)
+    counts=_cap_counts(u_dev,c_dev,r_dev)[:len(centers)]
+    if bool(jnp.any(counts<options.min_sites)):
+        index=int(jnp.argmin(counts))
+        raise ValueError(f"spherical PU cap needs more geometry data: cap {index}, sites {int(counts[index])}")
+    capacity=bucket(int(jnp.max(counts)),1)
+    ids,_=_cap_members(u_dev,c_dev,r_dev,capacity); ids=ids[:len(centers)]
+    active=ids>=0; bases=tangent_basis(centers); tans=jnp.tan(alphas)
+    member_u=directions[jnp.maximum(ids,0)]
+    cosine=jnp.sum(member_u*centers[:,None,:],axis=2)
+    sites=jnp.einsum("mkd,mnd->mnk",bases,member_u)/jnp.where(active,cosine,1.)[...,None]/tans[:,None,None]
+    sites=jnp.where(active[...,None],sites,0.)
+    matrix=jnp.concatenate([jnp.ones(active.shape+(1,)),sites],axis=2)*active[...,None]
+    rank=jnp.linalg.matrix_rank(matrix)
+    if bool(jnp.any(rank<d)):
         raise ValueError("spherical PU cap data do not span the cap")
-    values = np.where(active[..., None], positions[np.maximum(ids, 0)], 0.)
-    weights = np.zeros(sites.shape[:2] + (d,)); poly = np.zeros((len(centers), d, d)); origins = np.zeros((len(centers), d))
-    sizes = np.array([bucket(int(c), 8) for c in counts])
-    for size in np.unique(sizes):
-        group = np.flatnonzero(sizes == size)
-        per = (int(size) + d) ** 2 * 8 * 4
-        batch = bucket(max(1, min(len(group), (1 << 31) // per)), 1)
-        for start in range(0, len(group), batch):
-            g = group[start:start + batch]; k = len(g)
-            act = pad_rows(active[g, :size], batch, False)
-            act[k:, 0] = True
-            w, pc, o = _solve_local_fits(jnp.asarray(pad_rows(sites[g, :size], batch, 0.)),
-                                         jnp.asarray(pad_rows(values[g, :size], batch, 0.)), jnp.asarray(act))
-            weights[g, :size] = np.asarray(w)[:k]; poly[g] = np.asarray(pc)[:k]; origins[g] = np.asarray(o)[:k]
-    if not np.all(np.isfinite(weights)):
+    values=jnp.where(active[...,None],positions[jnp.maximum(ids,0)],0.)
+    weights=jnp.zeros(sites.shape[:2]+(d,)); poly=jnp.zeros((len(centers),d,d)); origins=jnp.zeros((len(centers),d))
+    for size,count,group in device_groups(jnp.maximum(counts,8)):
+        per=(size+d)**2*8*4
+        batch=bucket(max(1,min(count,(1<<31)//per)),1)
+        for start in range(0,count,batch):
+            amount=min(batch,count-start)
+            g=pad_device(group[start:start+amount],batch,len(centers))
+            w,pc,o=_solve_local_fits(*_bucket_data(sites,values,active,g,amount,size))
+            weights,poly,origins=_put_fits(weights,poly,origins,g,w,pc,o)
+    if not bool(jnp.all(jnp.isfinite(weights))):
         raise ValueError("nonfinite spherical PU fit")
-    model = SphericalPUModel(jnp.asarray(sites), jnp.asarray(weights), jnp.asarray(poly), jnp.asarray(origins),
-                             jnp.asarray(centers), jnp.asarray(bases), jnp.asarray(tans), jnp.asarray(chords),
-                             np.asarray(betas))
-    model.diagnostics = dict(cap_count=len(centers), support_counts=counts.tolist(), padded_capacity=capacity,
-                             kernel="r^3 + Pi_1 in scaled gnomonic coordinates", weights="Wendland C2 of chordal distance")
+    model=SphericalPUModel(sites,weights,poly,origins,centers,bases,tans,chords,betas)
+    model.diagnostics=dict(cap_count=len(centers),support_counts=[int(v) for v in counts],padded_capacity=capacity,
+        kernel="r^3 + Pi_1 in scaled gnomonic coordinates",weights="Wendland C2 of chordal distance")
     return model
 
 
@@ -366,31 +370,38 @@ def fit_spherical_pu(directions, positions, *, validation_directions=None, valid
     samples, every fifth sample is held out while the cover is selected and the accepted cover is refitted
     with all samples. initial_cover: optional (centers, covering radii).
     """
-    u = np.asarray(directions, float); x = np.asarray(positions, float)
+    u = jnp.asarray(directions, float); x = jnp.asarray(positions, float)
     if (u.ndim != 2 or u.shape[1] not in (2, 3) or x.shape != u.shape
-            or not np.isfinite(u).all() or not np.isfinite(x).all()):
+            or not jnp.isfinite(u).all() or not jnp.isfinite(x).all()):
         raise ValueError("finite unit-vector parameters and matching positions are required")
     if not 1 < options.overlap < 2 or options.min_sites < u.shape[1] + 1 or options.max_refinements < 0:
         raise ValueError("invalid spherical PU options")
-    u = u / np.linalg.norm(u, axis=1, keepdims=True)
-    length = 2 * np.linalg.norm(x - x.mean(axis=0), axis=1).max()
+    u = u / jnp.linalg.norm(u, axis=1, keepdims=True)
+    length = float(2 * jnp.linalg.norm(x - x.mean(axis=0), axis=1).max())
+    if not length>0:
+        raise ValueError("geometry data must have nonzero physical extent")
     tolerance = options.relative_position_tolerance * length
     if validation_directions is None:
-        check = np.arange(2, len(u), 5)
-        train = np.setdiff1d(np.arange(len(u)), check)
+        check = jnp.arange(2, len(u), 5)
+        train = jnp.asarray([i for i in range(len(u)) if i<2 or (i-2)%5],dtype=jnp.int32)
         vu, vx = u[check], x[check]
         fu, fx = u[train], x[train]
         kind = "heldout_data_sites"
     else:
-        vu = np.asarray(validation_directions, float); vu = vu / np.linalg.norm(vu, axis=1, keepdims=True)
-        vx = np.asarray(validation_positions, float)
+        vu = jnp.asarray(validation_directions, float); vu = vu / jnp.linalg.norm(vu, axis=1, keepdims=True)
+        vx = jnp.asarray(validation_positions, float)
         fu, fx = u, x
         kind = "separate_geometry_samples"
-    vn = None if validation_normals is None else np.asarray(validation_normals, float)
+    vn = None if validation_normals is None else jnp.asarray(validation_normals, float)
+    if (vu.ndim!=2 or vu.shape[1]!=u.shape[1] or vx.shape!=vu.shape or not len(vu)
+            or not bool(jnp.all(jnp.isfinite(vu))) or not bool(jnp.all(jnp.isfinite(vx)))):
+        raise ValueError("finite matching geometry validation arrays are required")
     if vn is not None:
-        vn = vn / np.linalg.norm(vn, axis=1, keepdims=True)
-    centers, betas = initial_caps(u.shape[1]) if initial_cover is None else map(np.asarray, initial_cover)
-    history = []; best = np.inf
+        if vn.shape!=vx.shape or not bool(jnp.all(jnp.isfinite(vn))) or bool(jnp.any(jnp.linalg.norm(vn,axis=1)==0)):
+            raise ValueError("finite nonzero validation normals must match positions")
+        vn = vn / jnp.linalg.norm(vn, axis=1, keepdims=True)
+    centers, betas = initial_caps(u.shape[1]) if initial_cover is None else map(jnp.asarray, initial_cover)
+    history = []; best = math.inf
     for refinement in range(options.max_refinements + 1):
         if len(centers) > options.max_caps:
             raise PUFitError("spherical PU refinement exceeded max_caps", history)
@@ -398,24 +409,24 @@ def fit_spherical_pu(directions, positions, *, validation_directions=None, valid
             model = _build(fu, fx, centers, betas, options)
         except ValueError as error:
             raise PUFitError(str(error), history) from error
-        pred = np.asarray(model.evaluate(vu)); jac, nr = map(np.asarray, model.frame(vu))
-        error = np.linalg.norm(pred - vx, axis=1)
-        sv = np.linalg.svd(np.nan_to_num(jac), compute_uv=False)
-        regular = np.isfinite(jac).all(axis=(1, 2)) & np.isfinite(nr).all(axis=1)
+        pred = jnp.asarray(model.evaluate(vu)); jac, nr = map(jnp.asarray, model.frame(vu))
+        error = jnp.linalg.norm(pred - vx, axis=1)
+        sv = jnp.linalg.svd(jnp.nan_to_num(jac), compute_uv=False)
+        regular = jnp.isfinite(jac).all(axis=(1, 2)) & jnp.isfinite(nr).all(axis=1)
         if u.shape[1] == 3:
-            regular &= sv[:, -1] > options.min_jacobian_ratio * np.maximum(sv[:, 0], 1e-300)
+            regular &= sv[:, -1] > options.min_jacobian_ratio * jnp.maximum(sv[:, 0], 1e-300)
         else:
             regular &= sv[:, 0] > 0
-        nerr = np.zeros(len(vu)) if vn is None else np.linalg.norm(nr - vn, axis=1)
-        failed = (error > tolerance) | (nerr > options.normal_tolerance) | ~regular | ~np.isfinite(error)
-        ratio = float(np.min(sv[:, -1] / np.maximum(sv[:, 0], 1e-300)))
+        nerr = jnp.zeros(len(vu)) if vn is None else jnp.linalg.norm(nr - vn, axis=1)
+        failed = (error > tolerance) | (nerr > options.normal_tolerance) | ~regular | ~jnp.isfinite(error)
+        ratio = float(jnp.min(sv[:, -1] / jnp.maximum(sv[:, 0], 1e-300)))
         score = max(float(error.max()) / tolerance, float(nerr.max()) / options.normal_tolerance,
                     options.min_jacobian_ratio / max(ratio, 1e-300) if u.shape[1] == 3 else 0.)
-        if not np.isfinite(score):
-            score = np.inf
+        if not math.isfinite(score):
+            score = math.inf
         history.append(dict(refinement=refinement, cap_count=len(centers), max_position_error=float(error.max()),
                             max_normal_error=None if vn is None else float(nerr.max()), min_jacobian_ratio=ratio,
-                            indicator_score=None if not np.isfinite(score) else score, failed_samples=int(failed.sum())))
+                            indicator_score=None if not math.isfinite(score) else score, failed_samples=int(failed.sum())))
         if not failed.any():
             if validation_directions is None:
                 model = _build(u, x, centers, betas, options)
@@ -428,9 +439,10 @@ def fit_spherical_pu(directions, positions, *, validation_directions=None, valid
         best = score
         if refinement == options.max_refinements:
             raise PUFitError(f"spherical PU did not meet the physical indicators: {history[-1]}", history)
-        bad = vu[failed]
-        chords = 2 * np.sin(options.overlap * betas / 2)
-        touched = {j for j in range(len(centers)) if np.any(np.sum((bad - centers[j]) ** 2, axis=1) < chords[j] ** 2)}
+        from kernelpack.accelerators.jax_spatial import compact_rows
+        bad = compact_rows(failed,vu)
+        chords = 2 * jnp.sin(options.overlap * betas / 2)
+        touched = {j for j in range(len(centers)) if jnp.any(jnp.sum((bad - centers[j]) ** 2, axis=1) < chords[j] ** 2)}
         centers, betas = split_caps(centers, betas, touched)
 
 
@@ -456,8 +468,8 @@ class ClosedSurfaceData:
 
     @classmethod
     def from_samples(cls, positions, *, center=None, latlong=None, normals=None, options=SphericalPUOptions()):
-        x = np.asarray(positions, float)
-        if x.ndim != 2 or x.shape[1] not in (2, 3) or not np.isfinite(x).all():
+        x = jnp.asarray(positions, float)
+        if x.ndim != 2 or x.shape[1] not in (2, 3) or not jnp.isfinite(x).all():
             raise ValueError("finite 2D curve or 3D surface samples are required")
         if latlong is not None:
             u = latlong_to_directions(latlong)
@@ -465,11 +477,11 @@ class ClosedSurfaceData:
                 raise ValueError("parameters do not match the samples")
             c = None
         else:
-            c = .5 * (x.min(axis=0) + x.max(axis=0)) if center is None else np.asarray(center, float)
+            c = .5 * (x.min(axis=0) + x.max(axis=0)) if center is None else jnp.asarray(center, float)
             u = directions_about(x, c)
             if normals is not None:
-                nr = np.asarray(normals, float)
-                if np.any(np.sum(nr * u, axis=1) <= 0):
+                nr = jnp.asarray(normals, float)
+                if jnp.any(jnp.sum(nr * u, axis=1) <= 0):
                     raise ValueError("the boundary is not star-shaped about the center (or the normals point inward)")
         return cls(x, u, c, options=options)
 
@@ -482,21 +494,23 @@ def sample_sphere_piece(model, radius, *, seed=0, supersample_fac=2):
     d = model.dim
     if radius <= 0 or supersample_fac < 1:
         raise ValueError("invalid spacing")
-    probe = np.asarray(fibonacci_sphere(2000)) if d == 3 else latlong_to_directions(np.linspace(0, 2 * np.pi, 720, endpoint=False))
+    probe = jnp.asarray(fibonacci_sphere(2000)) if d == 3 else latlong_to_directions(jnp.linspace(0, 2 * jnp.pi, 720, endpoint=False))
     jac, _ = model.frame(probe)
-    largest = float(np.max(np.linalg.svd(np.asarray(jac), compute_uv=False)[:, 0]))
-    if not np.isfinite(largest) or largest <= 0:
+    largest = float(jnp.max(jnp.linalg.svd(jnp.asarray(jac), compute_uv=False)[:, 0]))
+    if not jnp.isfinite(largest) or largest <= 0:
         raise ValueError("invalid spherical PU metric")
-    chord = float(radius) / (1.1 * largest * np.sqrt(float(supersample_fac)))
+    chord = float(radius) / (1.1 * largest * jnp.sqrt(float(supersample_fac)))
     if d == 2:
-        n = max(8, int(np.ceil(2 * np.pi / chord)))
-        t = 2 * np.pi * (np.arange(n) + np.random.default_rng(int(seed)).random()) / n
+        n = max(8, int(jnp.ceil(2 * jnp.pi / chord)))
+        phase=jax.random.uniform(jax.random.key(int(seed)),(),dtype=jnp.float64)
+        t = 2 * jnp.pi * (jnp.arange(n) + phase) / n
         return jnp.asarray(latlong_to_directions(t))
 
-    def draw(rng, n):
-        g = rng.standard_normal((n, d))
-        return g / np.linalg.norm(g, axis=1, keepdims=True)
-    n_draw = int(6 * 4 * np.pi / chord ** 2)
-    pts = poisson_disk_sample(-np.ones(d), np.ones(d), lambda p: np.full(len(p), chord), chord,
-                              seed=int(seed), draw=draw, n_draw=n_draw)
+    def draw(key, n):
+        g = jax.random.normal(key,(n,d),dtype=jnp.float64)
+        return g / jnp.linalg.norm(g, axis=1, keepdims=True)
+    n_draw = int(6 * 4 * jnp.pi / chord ** 2)
+    pts = poisson_disk_sample(-jnp.ones(d), jnp.ones(d), lambda p: jnp.full(len(p), chord), chord,
+                              seed=int(seed), draw=draw, n_draw=n_draw,
+                              require_gpu=model.sites.device.platform=="gpu")
     return jnp.asarray(pts)

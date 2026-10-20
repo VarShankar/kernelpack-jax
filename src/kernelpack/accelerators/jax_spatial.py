@@ -2,8 +2,8 @@
 
 Every jitted kernel sees power-of-two padded shapes, so it compiles once per
 size bucket rather than once per call. Data stay on the device; the host sees
-only scalars that fix static shapes (counts, bounding boxes, bucket sizes) and
-the seeded host RNG draws, which are uploaded once.
+only scalars or small grid metadata that fix static shapes (counts, bounding
+boxes, bucket sizes). Poisson candidates and priorities use device RNG.
 
 Primitives
 ----------
@@ -30,6 +30,10 @@ import jax.numpy as jnp
 from jax import jit, lax
 
 _UNDECIDED, _IN, _OUT = 0, 1, 2
+
+# Changing this changes the seeded cloud, not the MIS or spacing rule. Record it
+# with study provenance rather than identifying these clouds with old host RNG.
+POISSON_RNG_POLICY = "jax-threefry-fold-in-pass-candidate-priority-v1"
 
 
 def enable_compilation_cache(path: str | None = None) -> str:
@@ -114,27 +118,70 @@ def _offsets(dim: int) -> np.ndarray:
     return np.stack([g.ravel() for g in grids], axis=1).astype(np.int32)
 
 
+def _periodic_spec(dim, periodic=False, bounds=None):
+    """Small host metric metadata; point arrays never pass through NumPy."""
+    mask = np.broadcast_to(np.asarray(periodic, dtype=bool), (dim,)).copy()
+    if bounds is None:
+        if np.any(mask):
+            raise ValueError("periodic search requires bounds=(lo, hi)")
+        return mask, np.zeros(dim), np.ones(dim)
+    lower, upper = (np.asarray(v, dtype=float) for v in bounds)
+    if lower.shape != (dim,) or upper.shape != (dim,):
+        raise ValueError("bounds must contain two vectors matching the point dimension")
+    if not np.all(np.isfinite(lower)) or not np.all(np.isfinite(upper)) or np.any(upper <= lower):
+        raise ValueError("bounds must be finite with strictly positive lengths")
+    return mask, lower, upper - lower
+
+
+def _minimum_image(diff, periodic, lengths):
+    if periodic is None:
+        return diff
+    return jnp.where(periodic, diff - lengths * jnp.round(diff / lengths), diff)
+
+
 class CellGrid:
     """Uniform grid over a box with one-ring neighbour lookup (cell >= search radius)."""
 
-    def __init__(self, lo, hi, cell: float):
+    def __init__(self, lo, hi, cell: float, *, periodic=False, bounds=None):
         lo = np.asarray(lo, dtype=float)
         hi = np.asarray(hi, dtype=float)
-        if cell <= 0 or not np.all(np.isfinite(lo)) or not np.all(np.isfinite(hi)):
+        if not math.isfinite(cell) or cell <= 0 or not np.all(np.isfinite(lo)) or not np.all(np.isfinite(hi)):
             raise ValueError("grid needs a finite box and positive cell size")
         self.dim = int(lo.size)
         self.cell = float(cell)
-        self.lo = lo - 1e-9 * max(1.0, float(np.max(np.abs(hi - lo))))
+        # A unit-sized padding would overwhelm a physically tiny box. Relative
+        # padding plus one representable step still encloses coincident rows.
+        self.lo = np.nextafter(lo - 1e-9 * float(np.max(np.abs(hi - lo))), -np.inf)
         self.dims = np.maximum(1, np.ceil((hi - self.lo) / self.cell).astype(np.int64) + 1)
-        n_cells = int(np.prod(self.dims))
+        self.offsets = _offsets(self.dim)
+        self.periodic, self.origin, self.lengths = _periodic_spec(self.dim, periodic, bounds)
+        if np.any(self.periodic):
+            # floor(L / r), rather than ceil: each periodic cell is at least r
+            # wide. Consequently one wrapped ring contains every point closer
+            # than r, including when r exceeds an entire periodic box length.
+            periodic_dims = np.maximum(1, np.floor(self.lengths / cell).astype(np.int64))
+            self.dims = np.where(self.periodic, periodic_dims, self.dims)
+            self.lo = np.where(self.periodic, self.origin, self.lo)
+            self.cell = np.where(self.periodic, self.lengths / self.dims, cell)
+        n_cells = math.prod(int(v) for v in self.dims)
         if n_cells > 2**31 - 1:
             raise ValueError("cell grid too large; increase the cell size")
-        self.n_cells = n_cells
-        self.n_cells_pad = bucket(n_cells, 64)
-        self.offsets = _offsets(self.dim)
+        self.n_cells, self.n_cells_pad = n_cells, bucket(n_cells, 64)
 
     def device_args(self):
         return (jnp.asarray(self.lo), jnp.asarray(self.cell), jnp.asarray(self.dims.astype(np.int32)))
+
+    def metric_args(self):
+        if not np.any(self.periodic):
+            return (*self.device_args(), None, None)
+        return (*self.device_args(), jnp.asarray(self.periodic), jnp.asarray(self.lengths))
+
+    def canonicalize(self, points):
+        if not np.any(self.periodic):
+            return points
+        return jnp.where(jnp.asarray(self.periodic),
+                         jnp.asarray(self.origin) + jnp.mod(points - jnp.asarray(self.origin),
+                                                           jnp.asarray(self.lengths)), points)
 
 
 def _cell_coords(points, lo, cell, dims):
@@ -175,18 +222,33 @@ def _cell_table(points, valid, lo, cell, dims, n_cells_pad, capacity):
 def build_cell_table(grid: CellGrid, points, valid):
     """Device cell table for padded ``points`` (host or device); capacity is bucketed."""
     args = grid.device_args()
-    pts = jnp.asarray(points, float)
+    pts = grid.canonicalize(jnp.asarray(points, float))
     val = jnp.asarray(valid, bool)
     counts = _cell_counts(pts, val, *args, grid.n_cells_pad)
     capacity = bucket(int(jnp.max(counts)), 16)
     return _cell_table(pts, val, *args, grid.n_cells_pad, capacity)
 
 
-def _ring_candidates(query, table, offsets, lo, cell, dims):
+def _ring_candidates(query, table, offsets, lo, cell, dims, periodic=None):
+    if periodic is not None:
+        # Canonical periodic query chart. Nonperiodic coordinates are unchanged.
+        query = jnp.where(periodic, lo + jnp.mod(query - lo, cell * dims), query)
     c = _cell_coords(query, lo, cell, dims)
     neighbour = c[None, :] + offsets
-    inside = jnp.all((neighbour >= 0) & (neighbour < dims), axis=1)
-    flat = _flatten(jnp.clip(neighbour, 0, dims - 1), dims)
+    inside_axis = (neighbour >= 0) & (neighbour < dims)
+    if periodic is None:
+        inside = jnp.all(inside_axis, axis=1)
+        flat = _flatten(jnp.clip(neighbour, 0, dims - 1), dims)
+    else:
+        inside = jnp.all(inside_axis | periodic, axis=1)
+        wrapped = jnp.where(periodic, jnp.mod(neighbour, dims), jnp.clip(neighbour, 0, dims - 1))
+        flat = _flatten(wrapped, dims)
+        # For one/two cells on an axis, different offsets name the same cell.
+        # Keep its first valid occurrence; duplicate graph edges inflate counts
+        # and can otherwise hide real neighbors in a fixed-width list.
+        earlier = jnp.arange(offsets.shape[0])[None, :] < jnp.arange(offsets.shape[0])[:, None]
+        duplicate = jnp.any((flat[:, None] == flat[None, :]) & earlier & inside[None, :], axis=1)
+        inside = inside & ~duplicate
     rows = table[flat]
     rows = jnp.where(inside[:, None], rows, -1)
     return rows.reshape(-1)
@@ -194,13 +256,13 @@ def _ring_candidates(query, table, offsets, lo, cell, dims):
 
 @partial(jit, static_argnums=(10,))
 def _conflict_counts(queries, query_radii, query_ids, points, radii, valid, table, offsets, lo_cell_dims, scale, chunk):
-    lo, cell, dims = lo_cell_dims
+    lo, cell, dims, periodic, lengths = lo_cell_dims
 
     def one(q, rq, qi):
-        ids = _ring_candidates(q, table, offsets, lo, cell, dims)
+        ids = _ring_candidates(q, table, offsets, lo, cell, dims, periodic)
         ok = ids >= 0
         safe = jnp.where(ok, ids, 0)
-        d2 = jnp.sum((points[safe] - q) ** 2, axis=1)
+        d2 = jnp.sum(_minimum_image(points[safe] - q, periodic, lengths) ** 2, axis=1)
         thr = scale * jnp.maximum(rq, radii[safe])
         hit = ok & valid[safe] & (safe != qi) & (d2 < thr * thr)
         return jnp.sum(hit)
@@ -213,13 +275,13 @@ def _conflict_counts(queries, query_radii, query_ids, points, radii, valid, tabl
 
 @partial(jit, static_argnums=(10, 11))
 def _conflict_lists(queries, query_radii, query_ids, points, radii, valid, table, offsets, lo_cell_dims, scale, chunk, width):
-    lo, cell, dims = lo_cell_dims
+    lo, cell, dims, periodic, lengths = lo_cell_dims
 
     def one(q, rq, qi):
-        ids = _ring_candidates(q, table, offsets, lo, cell, dims)
+        ids = _ring_candidates(q, table, offsets, lo, cell, dims, periodic)
         ok = ids >= 0
         safe = jnp.where(ok, ids, 0)
-        d2 = jnp.sum((points[safe] - q) ** 2, axis=1)
+        d2 = jnp.sum(_minimum_image(points[safe] - q, periodic, lengths) ** 2, axis=1)
         thr = scale * jnp.maximum(rq, radii[safe])
         hit = ok & valid[safe] & (safe != qi) & (d2 < thr * thr)
         order = jnp.argsort(~hit, stable=True)[:width]
@@ -238,12 +300,14 @@ def _chunk_for(n_pad: int, ring: int, capacity_hint: int = 32) -> int:
     return int(min(n_pad, 2048))
 
 
-def conflict_lists(points, radii, valid, *, scale: float = 1.0):
+def conflict_lists(points, radii, valid, *, scale: float = 1.0, periodic=False, bounds=None):
     """Padded neighbour lists of the symmetric conflict graph.
 
     ``points``/``radii``/``valid`` (host or device) must already be padded to a power of two.
     Two valid points conflict iff ``|x - y| < scale * max(r_x, r_y)``.
     Returns a device int32 array ``(n_pad, width)`` with -1 padding.
+    ``periodic`` is a scalar or per-axis mask; ``bounds=(lo,hi)`` is required
+    when any axis is periodic. Distances then use the minimum-image metric.
     """
     pts = jnp.asarray(points, float)
     rad = jnp.asarray(radii, float)
@@ -253,10 +317,10 @@ def conflict_lists(points, radii, valid, *, scale: float = 1.0):
     rmax = float(jnp.max(jnp.where(val, rad, -jnp.inf))) * float(scale) if any_valid else 1.0
     if not any_valid:
         lo, hi = np.zeros(pts.shape[1]), np.ones(pts.shape[1])
-    grid = CellGrid(lo, hi, max(rmax, 1e-300))
+    grid = CellGrid(lo, hi, max(rmax, 1e-300), periodic=periodic, bounds=bounds)
     table = build_cell_table(grid, jnp.where(val[:, None], pts, jnp.asarray(lo)), val)
     offsets = jnp.asarray(grid.offsets)
-    lcd = grid.device_args()
+    lcd = grid.metric_args()
     ids = jnp.arange(n_pad, dtype=jnp.int32)
     chunk = _chunk_for(n_pad, len(grid.offsets), table.shape[1])
     counts = _conflict_counts(pts, rad, ids, pts, rad, val, table, offsets, lcd, float(scale), chunk)
@@ -306,13 +370,13 @@ def greedy_independent_set(neighbors, rank, *, fixed=None, excluded=None):
 
 @partial(jit, static_argnums=(7, 8))
 def _nearest_within(queries, points, valid, table, offsets, lo_cell_dims, radius, chunk, ordered):
-    lo, cell, dims = lo_cell_dims
+    lo, cell, dims, periodic, lengths = lo_cell_dims
 
     def one(q):
-        ids = _ring_candidates(q, table, offsets, lo, cell, dims)
+        ids = _ring_candidates(q, table, offsets, lo, cell, dims, periodic)
         ok = ids >= 0
         safe = jnp.where(ok, ids, 0)
-        diff = points[safe] - q
+        diff = _minimum_image(points[safe] - q, periodic, lengths)
         d2 = jnp.where(ok & valid[safe], ordered_sq_norm(diff) if ordered else jnp.sum(diff ** 2, axis=1), jnp.inf)
         if ordered:     # ties: lowest point index
             j = jnp.argmin(jnp.where(d2 == jnp.min(d2), safe, jnp.iinfo(jnp.int32).max))
@@ -326,12 +390,13 @@ def _nearest_within(queries, points, valid, table, offsets, lo_cell_dims, radius
     return d.reshape(-1), i.reshape(-1)
 
 
-def nearest_within(queries, points, radius: float, *, ordered: bool = False):
+def nearest_within(queries, points, radius: float, *, ordered: bool = False, periodic=False, bounds=None):
     """Distance and index of the nearest point, exact when <= ``radius`` (else inf, -1).
 
     Host or device inputs; device outputs. ``ordered``: distances are computed as
     ``sqrt(sum_k (x_k - y_k)^2)`` in coordinate order without contraction (bit-identical to
     numpy/scipy) and ties go to the lowest point index.
+    ``periodic`` and ``bounds`` have the same meaning as in ``conflict_lists``.
     """
     q = jnp.asarray(queries, float)
     p = jnp.asarray(points, float)
@@ -345,10 +410,11 @@ def nearest_within(queries, points, radius: float, *, ordered: bool = False):
     valid = jnp.arange(pp.shape[0]) < npnt
     qlo, qhi, _ = masked_box(qp, jnp.arange(qp.shape[0]) < nq)
     plo, phi, _ = masked_box(pp, valid)
-    grid = CellGrid(np.minimum(qlo, plo), np.maximum(qhi, phi), max(float(radius), 1e-300))
+    grid = CellGrid(np.minimum(qlo, plo), np.maximum(qhi, phi), max(float(radius), 1e-300),
+                    periodic=periodic, bounds=bounds)
     table = build_cell_table(grid, jnp.where(valid[:, None], pp, p[0]), valid)
     chunk = _chunk_for(qp.shape[0], len(grid.offsets), table.shape[1])
-    d, i = _nearest_within(qp, pp, valid, table, jnp.asarray(grid.offsets), grid.device_args(), float(radius),
+    d, i = _nearest_within(qp, pp, valid, table, jnp.asarray(grid.offsets), grid.metric_args(), float(radius),
                            chunk, bool(ordered))
     return d[:nq], i[:nq]
 
@@ -565,6 +631,17 @@ def _pass_accept(pts, rad, in_set, rank, n_prior, n):
     return jnp.where(keep[:, None], pts[src], 0.0), jnp.where(keep, rad[src], 0.0), n_take
 
 
+def _sampler_array(value, name, shape, dtype, require_gpu):
+    """Validate callbacks without an implicit host upload or dtype promotion."""
+    if not isinstance(value, jax.Array):
+        raise TypeError(f"{name} must return a JAX array, not a host array")
+    if value.shape != shape or value.dtype != jnp.dtype(dtype):
+        raise ValueError(f"{name} must have shape {shape} and dtype {jnp.dtype(dtype)}")
+    if require_gpu and any(device.platform != "gpu" for device in value.devices()):
+        raise ValueError(f"{name} must be on the GPU when require_gpu=True")
+    return value
+
+
 def poisson_disk_sample(
     lo,
     hi,
@@ -578,8 +655,10 @@ def poisson_disk_sample(
     oversample: float = 6.0,
     passes: int = 4,
     max_candidates: int = 1 << 23,
-    draw: Callable[[np.random.Generator, int], np.ndarray] | None = None,
+    draw: Callable[[jax.Array, int], jax.Array] | None = None,
     n_draw: int | None = None,
+    periodic=False,
+    require_gpu: bool = False,
 ):
     """Variable-radius Poisson-disk sampling as greedy independent sets.
 
@@ -588,49 +667,89 @@ def poisson_disk_sample(
     random priority order (dart throwing) against all points accepted so far
     and the ``fixed_points``. Conflict rule: ``|x - y| < max(r_x, r_y)``.
     Refill passes stop when a pass adds nothing. Returns the accepted points (device).
-    ``draw(rng, n)`` replaces the uniform box candidates (for example points on
+    ``draw(key, n)`` replaces the uniform box candidates (for example points on
     a sphere, with ``lo, hi`` a box containing them); ``n_draw`` then sets the
     number of candidates per pass.
 
-    The random draws (candidates, priorities) come from a seeded host RNG and are
-    uploaded once per pass; everything else stays on the device. ``accept`` and
-    ``radius_of`` receive a device array of ``n_draw`` rows (for ``radius_of``: the
-    accepted candidates first, the rest repeating the first one) and may return host
-    or device arrays.
+    Candidates and priorities are drawn by JAX on the selected device, under
+    ``POISSON_RNG_POLICY``. These seeded clouds differ from the previous host
+    NumPy RNG clouds. Callbacks return JAX float64 (or Boolean for ``accept``)
+    arrays. ``radius_of`` receives the accepted candidates first, followed by
+    repetitions of the first accepted candidate. ``periodic`` is a scalar or
+    per-axis mask, with ``lo,hi`` the periodic bounds. Fixed points are retained
+    as constraints even if their mutual spacing is smaller than their radii;
+    every new point must clear each fixed point under the symmetric rule.
+
+    ``require_gpu=True`` requires GPU float64 and never falls back to CPU.
+    The default also permits intentionally CPU JAX callers. All modes require
+    ``jax_enable_x64``; no float32 callback output is silently promoted.
     """
     lo = np.asarray(lo, float)
     hi = np.asarray(hi, float)
     dim = lo.size
+    if dim not in (2, 3) or lo.shape != (dim,) or hi.shape != (dim,):
+        raise ValueError("Poisson sampling supports two- or three-dimensional boxes")
+    if not np.all(np.isfinite(lo)) or not np.all(np.isfinite(hi)) or np.any(hi <= lo):
+        raise ValueError("sampling bounds must be finite with strictly positive lengths")
+    if not math.isfinite(float(min_radius)) or min_radius <= 0:
+        raise ValueError("min_radius must be finite and positive")
+    if not jax.config.jax_enable_x64:
+        raise ValueError("Poisson float64 sampling requires jax_enable_x64")
+    if require_gpu and jnp.zeros((), jnp.float64).device.platform != "gpu":
+        raise ValueError("require_gpu=True needs a GPU default device; CPU fallback is disabled")
+    _periodic_spec(dim, periodic, (lo, hi))
+    if int(passes) < 0 or int(max_candidates) < 256 or not math.isfinite(float(oversample)) or oversample <= 0:
+        raise ValueError("passes must be nonnegative, max_candidates >= 256, and oversample positive")
     volume = float(np.prod(np.maximum(hi - lo, 1e-300)))
     if n_draw is None:
         n_draw = oversample * volume / float(min_radius) ** dim
-    n_draw = int(min(max_candidates, max(256, n_draw)))
-    n_draw = bucket(n_draw, 256)
+    if not math.isfinite(float(n_draw)) or n_draw <= 0:
+        raise ValueError("n_draw must be finite and positive")
+    # Round down the cap so the power-of-two candidate pool cannot exceed it.
+    candidate_cap = 1 << int(math.floor(math.log2(int(max_candidates))))
+    n_draw = min(candidate_cap, bucket(int(max(256, n_draw)), 256))
+    if require_gpu and isinstance(fixed_points, jax.Array):
+        _sampler_array(fixed_points, "fixed_points", fixed_points.shape, jnp.float64, True)
+    if require_gpu and isinstance(fixed_radii, jax.Array):
+        _sampler_array(fixed_radii, "fixed_radii", fixed_radii.shape, jnp.float64, True)
     prior = (jnp.zeros((0, dim)) if fixed_points is None else jnp.asarray(fixed_points, float).reshape(-1, dim))
     n_fixed = int(prior.shape[0])
     prior_r = (jnp.full(n_fixed, float(min_radius)) if fixed_radii is None
                else jnp.broadcast_to(jnp.asarray(fixed_radii, float), (n_fixed,)))
+    if not bool(jnp.all(jnp.isfinite(prior))) or not bool(jnp.all(jnp.isfinite(prior_r) & (prior_r > 0))):
+        raise ValueError("fixed points must be finite and fixed radii finite and positive")
     if n_fixed == 0:
         prior, prior_r = jnp.zeros((1, dim)), jnp.zeros(1)
     n_prior = n_fixed
-    # Host RNG: O(N) draws/permutations cost milliseconds and add no compile variants.
-    rng = np.random.default_rng(int(seed))
+    # Explicit Threefry avoids depending on the process-wide PRNG implementation.
+    # fold_in makes a pass's cloud/priority keys independent of refill termination.
+    root_key = jax.random.key(int(seed), impl="threefry2x32")
+    lo_device, hi_device = jnp.asarray(lo), jnp.asarray(hi)
     for pass_index in range(int(passes)):
-        cand = lo + rng.random((n_draw, dim)) * (hi - lo) if draw is None else np.asarray(draw(rng, n_draw), float)
-        cand = jnp.asarray(cand)
-        ok = jnp.ones(n_draw, bool) if accept is None else jnp.asarray(accept(cand), bool)
+        pass_key = jax.random.fold_in(root_key, pass_index)
+        draw_key, priority_key = jax.random.split(pass_key)
+        cand = (_uniform(draw_key, n_draw, dim, lo_device, hi_device) if draw is None
+                else _sampler_array(draw(draw_key, n_draw), "draw", (n_draw, dim), jnp.float64, require_gpu))
+        if not bool(jnp.all(jnp.isfinite(cand))):
+            raise ValueError("draw returned nonfinite candidates")
+        ok = (jnp.ones(n_draw, bool) if accept is None
+              else _sampler_array(accept(cand), "accept", (n_draw,), jnp.bool_, require_gpu))
         n_cand = int(jnp.sum(ok))
         if not n_cand:
             break
         cand = _compact_first(cand, ok)
-        cand_r = jnp.asarray(radius_of(cand), float)
+        cand_r = _sampler_array(radius_of(cand), "radius_of", (n_draw,), jnp.float64, require_gpu)
+        if not bool(jnp.all(jnp.isfinite(cand_r) & (cand_r >= float(min_radius)))):
+            raise ValueError("radius_of must return finite radii at least min_radius")
         n = n_prior + n_cand
         n_pad = bucket(n)
-        perm = np.zeros(n_draw, np.int64)
-        perm[:n_cand] = rng.permutation(n_cand)
+        # A permutation of the fixed-size pool gives unique priorities also to
+        # every accepted prefix. Its induced relative order is uniform; unused
+        # ranks need not be contiguous and never participate in the graph.
+        perm = jax.random.permutation(priority_key, n_draw).astype(jnp.int32)
         pts, rad, valid, is_fixed, rank = _pass_layout(prior, prior_r, n_prior, cand, cand_r, n_cand,
-                                                       jnp.asarray(perm), n_pad)
-        neighbors = conflict_lists(pts, rad, valid)
+                                                       perm, n_pad)
+        neighbors = conflict_lists(pts, rad, valid, periodic=periodic, bounds=(lo, hi))
         in_set, _ = greedy_independent_set(neighbors, rank, fixed=is_fixed, excluded=~valid)
         prior, prior_r, n_take = _pass_accept(pts, rad, in_set, rank, n_prior, n)
         n_take = int(n_take)

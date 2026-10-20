@@ -14,6 +14,7 @@ from kernelpack.geometry import distance_matrix
 from kernelpack import poly
 from kernelpack.poly.core import _tensor_evaluate_with_recurrence
 from kernelpack.domain.stencils import exact_knn
+from kernelpack.kernels import safe_sqrt
 
 
 def _as_points(x: jnp.ndarray) -> jnp.ndarray:
@@ -28,24 +29,29 @@ def divfree_gram_matrix(x: jnp.ndarray, y: jnp.ndarray, degree: int) -> jnp.ndar
     """Assemble the divergence-free PHS block Gram matrix.
 
     The kernel is ``(-Delta I + grad grad^T) r^m`` with component-major
-    stacking: all x-components, then y-components, then z-components.
+    stacking: all x-components, then y-components, then z-components. The
+    continuous center value is exactly zero for odd degrees at least three.
+    The cubic matrix kernel is not classically differentiable at a center;
+    the finite AD convention there must not be interpreted as its derivative.
     """
     x = jnp.asarray(x, dtype=float)
     y = jnp.asarray(y, dtype=float)
     dim = x.shape[1]
     if dim not in (2, 3) or y.shape[1] != dim:
         raise ValueError("x and y must have matching 2D or 3D point dimensions")
-    if degree <= 0 or degree % 2 == 0:
-        raise ValueError("divergence-free PHS expects a positive odd degree")
+    if degree < 3 or degree % 2 == 0:
+        raise ValueError("continuous divergence-free PHS expects an odd degree >= 3")
 
     diff = x[:, None, :] - y[None, :, :]
-    r = jnp.sqrt(jnp.maximum(jnp.sum(diff * diff, axis=-1), 0.0)) + jnp.finfo(float).eps
-    r_m2 = r ** (degree - 2)
-    cross_coeff = degree * (degree - 2) * r ** (degree - 4)
+    r = safe_sqrt(jnp.sum(diff * diff, axis=-1))
+    positive = r > 0
+    safe_r = jnp.where(positive, r, 1.)
+    r_m2 = jnp.where(positive, safe_r ** (degree - 2), 0.)
+    cross_coeff = degree * (degree - 2) * safe_r ** (degree - 4)
     full_diag = -degree * (degree + dim - 2) * r_m2
 
     def block(a: int, b: int) -> jnp.ndarray:
-        hess = cross_coeff * diff[:, :, a] * diff[:, :, b]
+        hess = jnp.where(positive, cross_coeff * diff[:, :, a] * diff[:, :, b], 0.)
         return lax.cond(
             a == b,
             lambda h: h + degree * r_m2 + full_diag,
@@ -68,8 +74,8 @@ def DFPHS(dim: int, degree: int) -> tuple[int, int]:
     degree = int(degree)
     if dim not in (2, 3):
         raise ValueError("divergence-free PHS is only supported in 2D and 3D")
-    if degree <= 0 or degree % 2 == 0:
-        raise ValueError("divergence-free PHS expects a positive odd degree")
+    if degree < 3 or degree % 2 == 0:
+        raise ValueError("continuous divergence-free PHS expects an odd degree >= 3")
     return dim, degree
 
 
@@ -237,7 +243,95 @@ def _compressed_rank_candidate(raw,basis,tolerance,scale_floor):
     return compressed,near
 
 
+def _certified_full_rank_candidate(raw,basis,tolerance,scale_floor):
+    """SVD-free reduction for stencils that are certainly of full rank.
+
+    GPU SVDs of the 3D reduced factors (85 x 85 at degree four) cost about
+    10 ms each, while eigh of R.T R and a triangular solve cost microseconds.
+    With projected=raw@basis=QR, the transform basis@inv(R) spans the same
+    polynomial space as the SVD transform and gives orthonormal sampled values
+    raw@transform=Q, so the interpolant is unchanged in exact arithmetic. The
+    eigenvalues of R.T R carry absolute errors of order eps*||R||^2, so the
+    test sigma_min >= 1e-6 sigma_max, far above the 1e-12 rank threshold,
+    certifies that every column is active. Other stencils keep the SVD path.
+    """
+    projected=raw@basis
+    triangular=jnp.linalg.qr(projected,mode="r")
+    gram=jnp.swapaxes(triangular,-1,-2)@triangular
+    eigenvalues=jnp.linalg.eigvalsh(0.5*(gram+jnp.swapaxes(gram,-1,-2)))
+    largest=jnp.sqrt(jnp.maximum(eigenvalues[...,-1],0.))
+    smallest=jnp.sqrt(jnp.maximum(eigenvalues[...,0],0.))
+    identity=jnp.broadcast_to(jnp.eye(basis.shape[-1],dtype=raw.dtype),triangular.shape)
+    inverse=lax.linalg.triangular_solve(triangular,identity,left_side=True,lower=False)
+    transform=basis@inverse
+    sampled=raw@transform
+    active=jnp.ones(triangular.shape[:-1],dtype=bool)
+    ratio=smallest/jnp.where(largest>0,largest,1.)
+    # The Weyl bound of _compressed_rank_candidate, for the row-space projection.
+    residual=jnp.linalg.norm(raw-projected@basis.T,axis=(-2,-1))
+    defect=jnp.linalg.norm(basis.T@basis-jnp.eye(basis.shape[-1],dtype=basis.dtype))
+    roundoff=8*jnp.finfo(raw.dtype).eps*(
+        max(raw.shape[-2:])*jnp.linalg.norm(raw,axis=(-2,-1))
+        +max(projected.shape[-2:])*jnp.linalg.norm(projected,axis=(-2,-1)))
+    bound=residual+jnp.linalg.norm(projected,axis=(-2,-1))*defect+roundoff
+    scale=jnp.maximum(largest,scale_floor)
+    certified=((smallest>=1e-6*scale)&(smallest>tolerance*scale)&(bound<=1e-3*smallest)
+        &jnp.all(jnp.isfinite(sampled),axis=(-2,-1))&jnp.all(jnp.isfinite(transform),axis=(-2,-1)))
+    return (sampled,transform,active,ratio),certified
+
+
+def _pivoted_qr_reduce(raw,basis,tolerance,scale_floor):
+    """Rank-revealing reduction of one stencil by column-pivoted QR (the construction of the paper).
+
+    The pivots come from lax.linalg.qr(pivoting=True) without derivatives; an ordinary QR of the
+    permuted columns then gives a differentiable R. Columns k with |R_kk| above tolerance times
+    max(|R_11|, scale_floor) are retained as a prefix; the transform basis[:, perm] inv(R_11) has
+    orthonormal sampled values on them, and the other columns are zero and marked inactive.
+    """
+    projected=raw@basis
+    triangular=jnp.linalg.qr(projected,mode="r")
+    _,_,perm=lax.linalg.qr(lax.stop_gradient(triangular),pivoting=True,full_matrices=False)
+    pivoted=jnp.linalg.qr(triangular[:,perm],mode="r")
+    diagonal=jnp.abs(jnp.diagonal(pivoted))
+    first=jnp.maximum(diagonal[0],scale_floor)
+    active=jnp.cumprod(diagonal>tolerance*first).astype(bool)
+    keep=active[:,None]&active[None,:]
+    eye=jnp.eye(pivoted.shape[-1],dtype=raw.dtype)
+    leading=jnp.where(keep,pivoted,eye)
+    inverse=lax.linalg.triangular_solve(leading,eye,left_side=True,lower=False)
+    transform=(basis[:,perm]@inverse)*active[None,:]
+    ratio=jnp.min(jnp.where(active,diagonal/jnp.where(first>0,first,1.),jnp.inf))
+    ratio=jnp.where(jnp.any(active),ratio,0.)
+    return raw@transform,transform,active,ratio
+
+
 def _compressed_rank_reduce_impl(raw,basis,tolerance,scale_floor):
+    rank=min(raw.shape[-2],basis.shape[-1])
+    if raw.shape[-2]>basis.shape[-1]:
+        fast,certified=_certified_full_rank_candidate(raw,basis,tolerance,scale_floor)
+
+        # Uncertified stencils (possibly rank deficient): rank-revealing column-pivoted QR, about
+        # 200 times faster than a GPU singular value decomposition of these factors. A batch whose
+        # stencils are all certified skips it.
+        pivoted=lambda one_raw: _pivoted_qr_reduce(one_raw,basis,tolerance,scale_floor)
+        if raw.ndim==2:
+            return lax.cond(certified,lambda _:fast,pivoted,raw)
+        batch_shape=raw.shape[:-2]
+        flat_raw=raw.reshape((-1,)+raw.shape[-2:])
+
+        def refine(_):
+            fallback=jax.vmap(pivoted)(flat_raw)
+            out=[]
+            for value,other in zip(fast,fallback):
+                mask=certified.reshape(batch_shape+(1,)*(value.ndim-len(batch_shape)))
+                out.append(jnp.where(mask,value,other.reshape(value.shape)))
+            return tuple(out)
+
+        return lax.cond(jnp.all(certified),lambda _:fast,refine,operand=None)
+    return _svd_rank_reduce(raw,basis,tolerance,scale_floor)
+
+
+def _svd_rank_reduce(raw,basis,tolerance,scale_floor):
     compressed,near=_compressed_rank_candidate(raw,basis,tolerance,scale_floor)
     rank=min(raw.shape[-2],basis.shape[-1])
 
