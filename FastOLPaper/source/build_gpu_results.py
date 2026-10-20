@@ -44,16 +44,16 @@ assert len(rows) == 160
 models = ["fixed_no_poly", "trainable_no_poly", "fixed_affine", "trainable_affine"]
 NVALUES = [500, 1000, 5000, 10000]
 CASES = [
-    ("forced_turb", "Forced turbulence"),
-    ("species_transport", "Species transport"),
+    ("forced_turb", "Forced isotropic turbulence"),
+    ("species_transport", "Turbulent species transport"),
     ("merge_vortices_easier", "Merging vortices"),
-    ("lid_cavity_flow", "Lid cavity"),
-    ("flow_cylinder_laminar", "Cylinder, steady"),
-    ("flow_cylinder_shedding", "Cylinder, shedding"),
-    ("taylor_green", "Taylor--Green (space)"),
-    ("taylor_green_time", "Taylor--Green (time)"),
+    ("lid_cavity_flow", "Lid-driven cavity"),
+    ("flow_cylinder_laminar", "Cylinder flow (steady)"),
+    ("flow_cylinder_shedding", "Cylinder flow (vortex shedding)"),
+    ("taylor_green", "Taylor--Green vortices (space)"),
+    ("taylor_green_time", "Taylor--Green vortices (spacetime)"),
     ("backward_facing_step", "Backward-facing step"),
-    ("buoyancy_cavity_flow", "Buoyancy cavity"),
+    ("buoyancy_cavity_flow", "Buoyancy-driven cavity"),
 ]
 lookup = {(row["case"], int(row["N"]), row["model"]): row for row in rows}
 assert len(lookup) == 160
@@ -195,6 +195,17 @@ def fnum(value, digits=3):
         return rf"${coefficient:.{digits-1}f}\times10^{{{exponent}}}$"
     return f"{v:.{digits}g}"
 
+def bold(cell):
+    """Bold one table cell (math or text)."""
+    if cell.startswith("$") and cell.endswith("$") and cell.count("$") == 2:
+        return r"$\mathbf{" + cell[1:-1] + "}$"
+    return r"\textbf{" + cell + "}"
+
+def bold_best(cells, values, best=min):
+    """Bold every cell whose printed value equals that of the best value (ties at the printed precision)."""
+    target = cells[values.index(best(values))]
+    return [bold(c) if c == target else c for c in cells]
+
 def metric_table(metric, filename, label, caption, multiplier=1., digits=3):
     lines = [r"\begin{table}[pos=!htbp]", r"\centering\small",
              r"\setlength{\tabcolsep}{4pt}", r"\caption{"+caption+"}",
@@ -202,27 +213,26 @@ def metric_table(metric, filename, label, caption, multiplier=1., digits=3):
              r"Data set & Fixed & Fitted & Fixed + affine & Fitted + affine \\", r"\midrule"]
     for case, title in CASES:
         vals = [float(lookup[case,10000,m][metric])*multiplier for m in models]
-        lines.append(title+" & "+" & ".join(fnum(v,digits) for v in vals)+r" \\")
+        lines.append(title+" & "+" & ".join(bold_best([fnum(v,digits) for v in vals], vals))+r" \\")
     lines.extend([r"\bottomrule",r"\end{tabular}",r"\end{table}"])
     path=SOURCE/"sections"/filename
     path.write_text("\n".join(lines)+"\n",encoding="utf-8")
     outputs.append(path)
 
 metric_table("test_error", "gpu_accuracy_n10000.tex", "tab:gpu-accuracy-n10000",
-    "Test error (mean relative velocity error of the predictions for the 100 test inputs) at $N=10000$. The two augmented models use the same affine columns. Each model is fitted and validated separately, and all four use the same local output reconstruction. Both Taylor--Green cases use the amplitude normalization~\\eqref{eq:tg-response-transform}.")
+    "Test error (mean relative velocity error of the predictions for the 100 test inputs) at $N=10000$. The two augmented models use the same affine columns. Each model is fitted and validated separately, and all four use the same local output reconstruction. Both Taylor--Green cases use the amplitude normalization~\\eqref{eq:tg-response-transform}. Bold: smallest test error in each row.")
 
 # Compact full-suite timing/storage table at the largest N. Each cell gives
 # accounted decimal GB / synchronized warm ms for 100 fields.
 lines=[r"\begin{table}[pos=!htbp]",r"\centering\small",r"\setlength{\tabcolsep}{3pt}",
-       r"\caption{Accounted storage in decimal GB / median warm prediction time in ms for 100 fields at $N=10000$. Storage includes the stored model arrays, the solve buffers, and cuDSS's estimate of the memory of its factors. It is not measured peak GPU memory. Times include operator Lagrange evaluation and local output reconstruction.}",
+       r"\caption{Accounted storage in decimal GB / median warm prediction time in ms for 100 fields at $N=10000$. Storage includes the stored model arrays, the solve buffers, and cuDSS's estimate of the memory of its factors. It is not measured peak GPU memory. Times include operator Lagrange evaluation and local output reconstruction. Bold: smallest storage and smallest time in each row.}",
        r"\label{tab:gpu-cost-n10000}",r"\begin{tabular}{lrrrr}",r"\toprule",
        r"Data set & Fixed & Fitted & Fixed + affine & Fitted + affine \\",r"\midrule"]
 for case,title in CASES:
-    vals=[]
-    for model in models:
-        row=lookup[case,10000,model]
-        vals.append(f"{float(row['accounted_resident_storage_ESTIMATE_decimal_GB']):.3f} / {1000*float(row['warm_100query_median_seconds']):.1f}")
-    lines.append(title+" & "+" & ".join(vals)+r" \\")
+    gb=[float(lookup[case,10000,m]['accounted_resident_storage_ESTIMATE_decimal_GB']) for m in models]
+    ms=[1000*float(lookup[case,10000,m]['warm_100query_median_seconds']) for m in models]
+    gbc=bold_best([f"{v:.3f}" for v in gb], gb); msc=bold_best([f"{v:.1f}" for v in ms], ms)
+    lines.append(title+" & "+" & ".join(f"{a} / {b}" for a,b in zip(gbc,msc))+r" \\")
 lines += [r"\bottomrule",r"\end{tabular}",r"\end{table}"]
 path=SOURCE/"sections"/"gpu_cost_n10000.tex";path.write_text("\n".join(lines)+"\n",encoding="utf-8");outputs.append(path)
 
@@ -232,27 +242,36 @@ lines=[]
 short={"fixed_no_poly":"Fixed shape", "trainable_no_poly":"Fitted shape", "fixed_affine":"Fixed shape + affine", "trainable_affine":"Fitted shape + affine"}
 for index,(case,title) in enumerate(CASES):
     lines += [r"\begin{table}[pos=!htbp]",r"\centering\small",r"\setlength{\tabcolsep}{3.5pt}",
-       r"\caption{"+title+r": all models. Test error is the mean relative velocity error of the predictions for the 100 test inputs. Density is $d_K=\mathrm{nnz}(K_{UU})/N^2$ in percent. Factor is the number of entries of the cuDSS Cholesky factor in millions. GB is the accounted storage and ms the median warm time for all 100 fields.}",
+       r"\caption{"+title+r": all models. Test error is the mean relative velocity error of the predictions for the 100 test inputs. Density is $d_K=\mathrm{nnz}(K_{UU})/N^2$ in percent. Factor is the number of entries of the cuDSS Cholesky factor in millions. GB is the accounted storage and ms the median warm time for all 100 fields. Bold: smallest test error at each $N$.}",
        rf"\label{{tab:gpu-all-{case.replace('_','-')}}}",
        r"\begin{tabular}{rlrrrrr}",r"\toprule",
        r"$N$ & Operator model & Test error & Density (\%) & Factor ($10^6$) & GB & ms \\",r"\midrule"]
     for n in NVALUES:
-        for model in models:
+        errs=[float(lookup[case,n,m]['test_error']) for m in models]
+        errc=bold_best([fnum(v) for v in errs], errs)
+        for model,ec in zip(models,errc):
             row=lookup[case,n,model]
-            lines.append(f"{n} & {short[model]} & {fnum(row['test_error'])} & {100*float(row['kernel_density']):.2f} & {int(row['native_factor_nnz'])/1e6:.3f} & {float(row['accounted_resident_storage_ESTIMATE_decimal_GB']):.3f} & {1000*float(row['warm_100query_median_seconds']):.1f}"+r" \\")
+            lines.append(f"{n} & {short[model]} & {ec} & {100*float(row['kernel_density']):.2f} & {int(row['native_factor_nnz'])/1e6:.3f} & {float(row['accounted_resident_storage_ESTIMATE_decimal_GB']):.3f} & {1000*float(row['warm_100query_median_seconds']):.1f}"+r" \\")
         if n!=10000: lines.append(r"\addlinespace[3pt]")
     lines += [r"\bottomrule",r"\end{tabular}",r"\end{table}", ""]
 path=SOURCE/"sections"/"gpu_all_models_tables.tex";path.write_text("\n".join(lines),encoding="utf-8");outputs.append(path)
 
 lines=[r"\begin{table}[pos=tbp]",r"\centering\small",r"\setlength{\tabcolsep}{4pt}",
-       r"\caption{Offline and initialization costs at $N=10000$. Selection includes kernel fitting, where applicable, and validation. Rebuild assembles and factors the selected operator. Initialization includes two synchronized 100-field prediction passes, compilation, and CUDA graph preparation. The four models share the setup of the output reconstruction and may reuse compiled code. The dash marks the selection time of the fixed-shape backward-facing-step model, which contains an external pause. Its raw time is in the released data.}",
+       r"\caption{Offline and initialization costs at $N=10000$. Selection includes kernel fitting, where applicable, and validation. Rebuild assembles and factors the selected operator. Initialization includes two synchronized 100-field prediction passes, compilation, and CUDA graph preparation. The four models share the setup of the output reconstruction and may reuse compiled code. The dash marks the selection time of the fixed-shape backward-facing-step model, which contains an external pause. Its raw time is in the released data. Bold: smallest time in each column for each data set.}",
        r"\label{tab:gpu-offline-n10000}",r"\begin{tabular}{llrrr}",r"\toprule",
        r"Data set & Operator model & Selection (min) & Rebuild (s) & Initialization (s) \\",r"\midrule"]
 for case,title in CASES:
+    rows=[lookup[case,10000,m] for m in models]
+    ok=[r['selection_time_comparable_without_interruption']=='True' for r in rows]
+    sel=[float(r['training_validation_minutes']) for r in rows]
+    selv=[s for s,o in zip(sel,ok) if o]
+    selc=[f"{s:.2f}" if o else "---" for s,o in zip(sel,ok)]
+    best_sel=f"{min(selv):.2f}"
+    selc=[bold(c) if c==best_sel else c for c in selc]
+    reb=[float(r['operator_setup_seconds']) for r in rows]; rebc=bold_best([f"{v:.2f}" for v in reb], reb)
+    ini=[float(r['first_prediction_compile_capture_seconds']) for r in rows]; inic=bold_best([f"{v:.2f}" for v in ini], ini)
     for i,model in enumerate(models):
-        row=lookup[case,10000,model]
-        selected=f"{float(row['training_validation_minutes']):.2f}" if row['selection_time_comparable_without_interruption']=='True' else "---"
-        lines.append((title if i==0 else "")+" & "+short[model]+f" & {selected} & {float(row['operator_setup_seconds']):.2f} & {float(row['first_prediction_compile_capture_seconds']):.2f}"+r" \\")
+        lines.append((title if i==0 else "")+" & "+short[model]+f" & {selc[i]} & {rebc[i]} & {inic[i]}"+r" \\")
     lines.append(r"\addlinespace[3pt]")
 lines += [r"\bottomrule",r"\end{tabular}",r"\end{table}"]
 path=SOURCE/"sections"/"gpu_offline_n10000.tex";path.write_text("\n".join(lines)+"\n",encoding="utf-8");outputs.append(path)
@@ -268,7 +287,7 @@ def decay_rate_table():
     xm = sum(x)/len(x)
     lines = [r"\begin{table}[pos=!htbp]", r"\centering\small",
              r"\setlength{\tabcolsep}{4pt}",
-             r"\caption{Least-squares exponent $\tau$ of the test error $\propto N^{-\tau}$ over $N\in\{500,1000,5000,10000\}$.}",
+             r"\caption{Least-squares exponent $\tau$ of the test error $\propto N^{-\tau}$ over $N\in\{500,1000,5000,10000\}$. Bold: fastest decay in each row.}",
              r"\label{tab:gpu-decay-rates}", r"\begin{tabular}{lrrrr}", r"\toprule",
              r"Data set & Fixed & Fitted & Fixed + affine & Fitted + affine \\", r"\midrule"]
     rates = {}
@@ -280,7 +299,7 @@ def decay_rate_table():
             slope = sum((a-xm)*(b-ym) for a, b in zip(x, y))/sum((a-xm)**2 for a in x)
             vals.append(-slope)
         rates[case] = vals
-        lines.append(titles[case]+" & "+" & ".join(f"{v:.2f}".replace("-", "$-$") for v in vals)+r" \\")
+        lines.append(titles[case]+" & "+" & ".join(bold_best([f"{v:.2f}".replace("-", "$-$") for v in vals], vals, best=max))+r" \\")
     lines.extend([r"\bottomrule", r"\end{tabular}", r"\end{table}"])
     path = SOURCE/"sections"/"gpu_decay_rates.tex"
     path.write_text("\n".join(lines)+"\n", encoding="utf-8")

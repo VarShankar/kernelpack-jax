@@ -63,11 +63,11 @@ S = fastol_plot_style();
 T = readtable(file, 'TextType', 'string', 'Delimiter', ',', 'VariableNamingRule', 'preserve');
 assert(height(T) == 160, 'expected 160 fitted models');
 N = [500 1000 5000 10000];
-cases = {'forced_turb', 'Forced turbulence'; 'species_transport', 'Species transport';
-    'merge_vortices_easier', 'Merging vortices'; 'lid_cavity_flow', 'Lid cavity';
-    'flow_cylinder_laminar', 'Cylinder, steady'; 'flow_cylinder_shedding', 'Cylinder, shedding';
-    'taylor_green', 'Taylor--Green (space)'; 'taylor_green_time', 'Taylor--Green (time)';
-    'backward_facing_step', 'Backward-facing step'; 'buoyancy_cavity_flow', 'Buoyancy cavity'};
+cases = {'forced_turb', 'Forced isotropic turbulence'; 'species_transport', 'Turbulent species transport';
+    'merge_vortices_easier', 'Merging vortices'; 'lid_cavity_flow', 'Lid-driven cavity';
+    'flow_cylinder_laminar', 'Cylinder flow (steady)'; 'flow_cylinder_shedding', 'Cylinder flow (vortex shedding)';
+    'taylor_green', 'Taylor--Green vortices (space)'; 'taylor_green_time', 'Taylor--Green vortices (spacetime)';
+    'backward_facing_step', 'Backward-facing step'; 'buoyancy_cavity_flow', 'Buoyancy-driven cavity'};
 metrics = {   % name, column, multiplier, y label, log scale
     'error',   'test_error',                                      1,    'relative test error',       true;
     'density', 'kernel_density',                                  100,  'matrix density (\%)',        false;
@@ -127,12 +127,12 @@ function gpu_summary(file, out)
 S = fastol_plot_style();
 T = readtable(file, 'TextType', 'string', 'Delimiter', ',', 'VariableNamingRule', 'preserve');
 assert(height(T) == 160, 'expected 160 fitted models');
-cases = {'forced_turb', 'Forced turbulence'; 'species_transport', 'Species transport';
+cases = {'forced_turb', 'Forced isotropic turbulence'; 'species_transport', 'Turbulent species transport';
     'merge_vortices_easier', 'Merging vortices';
-    'lid_cavity_flow', 'Lid cavity'; 'flow_cylinder_laminar', 'Cylinder, steady';
-    'flow_cylinder_shedding', 'Cylinder, shedding'; 'backward_facing_step', 'Backward-facing step';
-    'buoyancy_cavity_flow', 'Buoyancy cavity';
-    'taylor_green', 'Taylor--Green (space)'; 'taylor_green_time', 'Taylor--Green (time)'};
+    'lid_cavity_flow', 'Lid-driven cavity'; 'flow_cylinder_laminar', 'Cylinder flow (steady)';
+    'flow_cylinder_shedding', 'Cylinder flow (vortex shedding)'; 'backward_facing_step', 'Backward-facing step';
+    'buoyancy_cavity_flow', 'Buoyancy-driven cavity';
+    'taylor_green', 'Taylor--Green vortices (space)'; 'taylor_green_time', 'Taylor--Green vortices (spacetime)'};
 % rows top to bottom, with a thin gap between the three groups of benchmarks
 yrow = [1 2 3, 4.5 5.5 6.5 7.5 8.5 9.5, 11 12];
 yrow = yrow(1:10);
@@ -147,7 +147,7 @@ for i = 1:nc
 end
 ratio = err(:, 1) ./ err(:, 2:4);
 
-left = 3.6; gap = 0.6; axh = 6.6; bottom = 1.15; top = 0.15;
+left = 4.6; gap = 0.6; axh = 6.6; bottom = 1.15; top = 0.15;   % room for the longest benchmark name
 W = left + 2*S.axw + gap + 0.4;
 fig = figure('Units', 'centimeters', 'Position', [2 2 W bottom + axh + top], 'Color', 'w', 'Visible', 'off');
 ax(1) = axes(fig, 'Units', 'centimeters', 'Position', [left bottom S.axw axh]);

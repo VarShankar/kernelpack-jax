@@ -18,11 +18,11 @@ HERE = Path(__file__).resolve().parent
 EVID = HERE.parent / "evidence" / "gpu_evaluation" if len(sys.argv) < 2 else Path(sys.argv[1])
 SEC = HERE / "sections"
 SEC.mkdir(exist_ok=True)
-CASES = [("forced_turb", "Forced turbulence"), ("species_transport", "Species transport"),
-         ("merge_vortices_easier", "Merging vortices"), ("lid_cavity_flow", "Lid cavity"),
-         ("flow_cylinder_laminar", "Cylinder, steady"), ("flow_cylinder_shedding", "Cylinder, shedding"),
-         ("backward_facing_step", "Backward-facing step"), ("buoyancy_cavity_flow", "Buoyancy cavity"),
-         ("taylor_green", "Taylor--Green (space)"), ("taylor_green_time", "Taylor--Green (time)")]
+CASES = [("forced_turb", "Forced isotropic turbulence"), ("species_transport", "Turbulent species transport"),
+         ("merge_vortices_easier", "Merging vortices"), ("lid_cavity_flow", "Lid-driven cavity"),
+         ("flow_cylinder_laminar", "Cylinder flow (steady)"), ("flow_cylinder_shedding", "Cylinder flow (vortex shedding)"),
+         ("backward_facing_step", "Backward-facing step"), ("buoyancy_cavity_flow", "Buoyancy-driven cavity"),
+         ("taylor_green", "Taylor--Green vortices (space)"), ("taylor_green_time", "Taylor--Green vortices (spacetime)")]
 
 
 def sci(x, digits=1):
@@ -31,6 +31,18 @@ def sci(x, digits=1):
     e = int(f"{x:e}".split("e")[1])
     m = x / 10 ** e
     return f"${m:.{digits}f}\\times10^{{{e}}}$"
+
+
+def bold(cell):
+    """Bold a math cell "$...$", keeping any text after it."""
+    i = cell.index("$", 1)
+    return r"$\mathbf{" + cell[1:i] + "}$" + cell[i + 1:]
+
+
+def bold_best(cells, values, best=min):
+    """Bold every cell whose printed value equals that of the best value (ties at the printed precision)."""
+    target = cells[values.index(best(values))]
+    return [bold(c) if c == target else c for c in cells]
 
 
 def load(name):
@@ -78,13 +90,15 @@ def main():
         if not rs:
             continue
         gmax = max(r["global_direct"] / r["global_lagrange"] for r in by[case])
-        arows.append(f"{name} & {sci(rs[0]['alpha_global'])} & ${rs[0]['alpha_local']:.0f}$ & ${gmax:.1f}$ \\\\")
+        ag, al = bold_best([sci(rs[0]['alpha_global']), f"${rs[0]['alpha_local']:.0f}$"],
+                           [rs[0]['alpha_global'], rs[0]['alpha_local']])
+        arows.append(f"{name} & {ag} & {al} & ${gmax:.1f}$ \\\\")
     amp = [r"\begin{table}[pos=tbp]", r"\centering\small", r"\setlength{\tabcolsep}{4pt}",
            r"\caption{Amplification factor $\alpha_{\rm spatial}=\|B\|_F\|(\bA^\star)^{\mathsf T}\|_F/\|B(\bA^\star)^{\mathsf T}\|_F$ "
            r"of~\eqref{eq:spatial-amplification}, which measures the cancellation among the spatial coefficients, for $N=1000$ "
            r"training fields, for the global and for our local output reconstruction (stencils combined as in "
            r"Section~\ref{sec:lagrange_accuracy}), and the largest ratio of the direct to the Lagrange error with global "
-           r"output reconstruction from Table~\ref{tab:lagrange-all}.}",
+           r"output reconstruction from Table~\ref{tab:lagrange-all}. Bold: smaller amplification factor in each row.}",
            r"\label{tab:amplification}", r"\begin{tabular}{lrrr}", r"\toprule",
            r"Data set & Global $\alpha_{\rm spatial}$ & Local $\alpha_{\rm spatial}$ & Largest gain (global) \\", r"\midrule",
            *arows, r"\bottomrule", r"\end{tabular}", r"\end{table}", ""]
@@ -93,14 +107,16 @@ def main():
     # ---- lid-cavity matched control (validated fixed-shape model, global reconstruction)
     crow = []
     for r in sorted((r for r in by.get("lid_cavity_flow", []) if r["model"] == "fixed_selected"), key=lambda r: r["N"]):
-        crow.append(f"{r['N']} & {sci(r['global_direct'], 2)} & {sci(r['global_lagrange'], 2)} & "
-                    f"{r['global_direct'] / r['global_lagrange']:.2f} & {sci(r['global_direct_samples'], 2)} & "
+        ev = [r['global_direct'], r['global_lagrange'], r['global_direct_samples']]
+        d, lg, ds = bold_best([sci(v, 2) for v in ev], ev)
+        crow.append(f"{r['N']} & {d} & {lg} & "
+                    f"{r['global_direct'] / r['global_lagrange']:.2f} & {ds} & "
                     f"{sci(r['global_coeff_norm'], 2)} \\\\")
     ctl = [r"\begin{table}[pos=!htbp]", r"\centering\small",
            r"\caption{Test error at the nodes (mean relative velocity error over the 100 test inputs) of direct and Lagrange evaluation of the validated "
-           r"unaugmented fixed-shape lid-cavity model with global output reconstruction, of direct evaluation applied to the "
+           r"unaugmented fixed-shape model of the lid-driven cavity with global output reconstruction, of direct evaluation applied to the "
            r"sampled velocities instead of the coefficients, and the Frobenius norm of the spatial coefficients of the "
-           r"training fields.}",
+           r"training fields. Bold: smallest test error in each row.}",
            r"\label{tab:lagrange-matched-control}", r"\begin{tabular}{rrrrrr}", r"\toprule",
            r"$N$ & Direct & Lagrange & Direct/Lagrange & Direct on samples & $\|B\|_F$ \\", r"\midrule", *crow,
            r"\bottomrule", r"\end{tabular}", r"\end{table}", ""]
@@ -113,17 +129,17 @@ def main():
         if r is None:
             continue
         assert r["N"] == 10000 and "global" in r, (case, r["N"])
+        lv = r["local_multiscale"] if "local_multiscale" in r else r["local_default"]
+        glob, loc = bold_best([sci(r["global"], 2), sci(lv, 2)], [r["global"], lv])
         if "local_multiscale" in r:
-            loc = sci(r["local_multiscale"], 2) + " (multiscale)"
-        else:
-            loc = sci(r["local_default"], 2)
-        srow.append(f"{name} & {r['m']} & {r['held_out']} & {sci(r['global'], 2)} & {loc} \\\\")
+            loc += " (multiscale)"
+        srow.append(f"{name} & {r['m']} & {r['held_out']} & {glob} & {loc} \\\\")
     st = [r"\begin{table}[pos=tbp]", r"\centering\small", r"\setlength{\tabcolsep}{4pt}",
           r"\caption{Test error between the nodes. We reconstruct the predicted nodal velocities of the 100 test inputs "
           r"(model with the smallest validation error at $N=10000$) and measure the mean relative velocity error at the "
           r"evaluation points, the mesh points of each data set that are not among its $m$ nodes. Global: the divergence-free Mat\'ern interpolant of~\citet{sharma2026fluids} on all "
           r"nodes. Local: our output reconstruction with the cubic PHS, or with the multiscale Mat\'ern kernel ($c_\sigma=16$) "
-          r"where marked (Appendix~\ref{app:multiscale-spatial} compares it with the PHS).}",
+          r"where marked (Appendix~\ref{app:multiscale-spatial} compares it with the PHS). Bold: smaller error in each row.}",
           r"\label{tab:spatial-reconstruction-controls}", r"\begin{tabular}{lrrrr}", r"\toprule",
           r"Data set & Nodes $m$ & Evaluation points & Global & Local \\", r"\midrule", *srow,
           r"\bottomrule", r"\end{tabular}", r"\end{table}", ""]
@@ -133,7 +149,7 @@ def main():
     figs = []
     ticks = {"species_transport": "xtick={0.003,0.01,0.03,0.1}, ytick={200,300,500,800}, ",
              "forced_turb": "xtick={0.7,1,2,3}, ytick={0.5,0.7,1,1.4}, "}
-    for case, title in (("species_transport", "Species transport"), ("forced_turb", "Forced turbulence")):
+    for case, title in (("species_transport", "Turbulent species transport"), ("forced_turb", "Forced isotropic turbulence")):
         r = spa.get(case)
         if not r or "structure_functions" not in r:
             continue
