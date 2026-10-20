@@ -20,7 +20,7 @@ SEC = HERE / "sections"
 SEC.mkdir(exist_ok=True)
 CASES = [("forced_turb", "Forced isotropic turbulence"), ("species_transport", "Turbulent species transport"),
          ("merge_vortices_easier", "Merging vortices"), ("lid_cavity_flow", "Lid-driven cavity"),
-         ("flow_cylinder_laminar", "Cylinder flow (steady)"), ("flow_cylinder_shedding", "Cylinder flow (vortex shedding)"),
+         ("flow_cylinder_laminar", "Cylinder flow (no shedding)"), ("flow_cylinder_shedding", "Cylinder flow (vortex shedding)"),
          ("backward_facing_step", "Backward-facing step"), ("buoyancy_cavity_flow", "Buoyancy-driven cavity"),
          ("taylor_green", "Taylor--Green vortices (space)"), ("taylor_green_time", "Taylor--Green vortices (spacetime)")]
 

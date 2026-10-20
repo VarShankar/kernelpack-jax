@@ -48,7 +48,7 @@ CASES = [
     ("species_transport", "Turbulent species transport"),
     ("merge_vortices_easier", "Merging vortices"),
     ("lid_cavity_flow", "Lid-driven cavity"),
-    ("flow_cylinder_laminar", "Cylinder flow (steady)"),
+    ("flow_cylinder_laminar", "Cylinder flow (no shedding)"),
     ("flow_cylinder_shedding", "Cylinder flow (vortex shedding)"),
     ("taylor_green", "Taylor--Green vortices (space)"),
     ("taylor_green_time", "Taylor--Green vortices (spacetime)"),
