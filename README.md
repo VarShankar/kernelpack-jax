@@ -58,6 +58,27 @@ paper and the node generation paper it builds on:
 }
 ```
 
+If you use the local and sparse kernel operator learning of
+`kernelpack.operator_learning` (FastOL), please cite:
+
+```bibtex
+@unpublished{sharma2026local,
+  author = {Sharma, Ramansh and Lowery, Matthew and Owhadi, Houman and Shankar, Varun},
+  title  = {Local and Sparse Kernel Operator Learning for Incompressible Flows:
+            An Operator {L}agrange Formulation},
+  note   = {Submitted to Journal of Computational Physics},
+  year   = {2026}
+}
+
+@article{sharma2026fluids,
+  author  = {Sharma, Ramansh and Lowery, Matthew and Owhadi, Houman and Shankar, Varun},
+  title   = {Fluids You Can Trust: Property-Preserving Operator Learning for
+             Incompressible Flows},
+  journal = {arXiv preprint arXiv:2602.15472},
+  year    = {2026}
+}
+```
+
 Papers for the other components are listed under
 [Research foundations](#research-foundations).
 
@@ -373,6 +394,20 @@ The stages are `clouds`, `forward`, `euclid`, `estimate`, `inverse`, `obstacle`,
 `stats`, and `figures`; results are written to `Outputs_and_results/`, the LaTeX tables to
 `KernelPackJaxPaper/`, and the plot data to `Outputs_and_results/paper_figures/plot_data.json`,
 from which `scripts/matlab/paper_plots.m` draws the figures.
+
+## Reproducing the FastOL paper
+
+The local divergence-free output reconstruction, the sparse operator regression
+with a compactly supported kernel, and operator Lagrange prediction live in
+`kernelpack.operator_learning` (install the `fastol` extras and the cuDSS
+extension above). [`FastOLPaper/README.md`](FastOLPaper/README.md) lists the
+scripts that produce every result of the paper and the scripts that build its
+tables and figures from those results. The benchmark data sets are those of
+*Fluids You Can Trust* (arXiv:2602.15472).
+
+```bash
+python -m pip install -e .[fastol]
+```
 
 ## Project status
 

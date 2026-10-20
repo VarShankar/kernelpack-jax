@@ -1,0 +1,13 @@
+# Results are produced by running the scripts; they are not stored in the repository.
+*.json
+*.jsonl
+*.csv
+*.txt
+*.log
+*.used
+*.mat
+evidence/**/*.md
+source/sections/
+source/figures/
+source/gpu_figures/
+source/gpu_data/

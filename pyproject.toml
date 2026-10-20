@@ -50,6 +50,10 @@ paper = [
   "optax>=0.2",
   "optimistix>=0.1",
 ]
+fastol = [
+  "equinox>=0.13",
+  "h5py>=3.11",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
