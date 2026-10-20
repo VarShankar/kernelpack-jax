@@ -1,8 +1,8 @@
 function fastol_field_figures(F, out)
 % Benchmark field figures (appendix): first supplied simulation of each data set, two panels,
-% colour fields from linear interpolation of the supplied samples (scatteredInterpolant,
-% 'linear', no extrapolation) on a fine grid, masked by the exact domain (or, for species
-% transport, by the supplied SU2 hexahedral mesh). Panels of the same quantity share a colour
+% 2D colour fields from linear interpolation of the supplied samples (scatteredInterpolant,
+% 'linear', no extrapolation) on a fine grid, masked by the exact domain; the 3D benchmarks
+% (species transport, forced turbulence) use local cubic PHS interpolation (phs_local). Panels of the same quantity share a colour
 % scale. Exported raster (-opengl -r600) because vector export downsamples images.
 %   fastol_fields_<case>.pdf
 S = fastol_plot_style();
@@ -84,43 +84,117 @@ title(P.ax(1), '(A) Initial vorticity'); title(P.ax(2), '(B) Final speed');
 P.colorbar(1, 'vorticity $\omega$'); P.colorbar(2, 'speed $\|\mathbf{u}\|$');
 P.save(fullfile(out, 'fastol_fields_merge_vortices_easier'));
 
-% ---- species transport: (A) inlet velocity on z = 0, (B) speed at t = 0.5 on x = 0 (y expanded)
-Sp = F.species; Me = F.species_mesh;
-[x, y] = grid2([-0.01 0.01], [-0.01 0.01], 700);
-inlet = [Me.markers.inlet_gas; Me.markers.inlet_air];
-tri = [inlet(:, [1 2 3]); inlet(:, [1 3 4])];
-Tin = triangulation(tri, Me.nodes(:, 1:2));
-[X, Y] = meshgrid(x, y);
-mA = reshape(~isnan(pointLocation(Tin, [X(:) Y(:)])), size(X));
-A = field2(Sp.bc_points(:, 1:2), Sp.inlet(:), x, y, []); A(~mA) = NaN;
-[z, y2] = grid2([0 0.26], [-0.01 0.01], 1500, 500);
-[Z, Y2] = meshgrid(z, y2);
-mB = section_mask(Me, z, y2);
-I = scatteredInterpolant(Sp.points, sp(Sp.u), 'linear', 'none');
-B = reshape(I(zeros(numel(Z), 1), Y2(:), Z(:)), size(Z)); B(~mB) = NaN;
-P = panels(W, W, 'separate');
-draw(P.ax(1), x, y, A, [min(A(:)) max(A(:))]); draw(P.ax(2), z, y2, B, [0 max(B(:))]);
-axes_xy(P.ax(1), [-0.01 0.01], [-0.01 0.01], -0.01:0.01:0.01, -0.01:0.01:0.01);
-axes_xy(P.ax(2), [0 0.26], [-0.01 0.01], 0:0.13:0.26, -0.01:0.01:0.01);
-xlabel(P.ax(2), '$z$');
-title(P.ax(1), '(A) Inlet velocity, $z=0$'); title(P.ax(2), '(B) Speed at $t=0.5$, $x=0$');
-P.colorbar(1, 'inlet velocity'); P.colorbar(2, 'speed $\|\mathbf{u}\|$');
-P.save(fullfile(out, 'fastol_fields_species_transport'));
+% ---- species transport: (A) inlet velocity on z = 0, (B) speed at t = 0.5 in the mixer (3D)
+species_figure(F.species, F.species_mesh, out);
 
-% ---- forced turbulence on z = pi: (A) forcing magnitude, (B) speed at t = 0.5 (periodic images)
-Ft = F.forced;
-[pp, idx] = periodic_images(Ft.points, 2*pi, 3*2*pi/32);
-[x, y] = grid2([0 2*pi], [0 2*pi], 700);
-[X, Y] = meshgrid(x, y); Zq = pi*ones(numel(X), 1);
-fm = sp(Ft.f); um = sp(Ft.u);
-I = scatteredInterpolant(pp, fm(idx), 'linear', 'none'); A = reshape(I(X(:), Y(:), Zq), size(X));
-I.Values = um(idx); B = reshape(I(X(:), Y(:), Zq), size(X));
-P = panels(W, W, 'separate');
-draw(P.ax(1), x, y, A, [0 max(A(:))]); draw(P.ax(2), x, y, B, [0 max(B(:))]);
-for a = P.ax, axes_xy(a, [0 2*pi], [0 2*pi], [0 pi 2*pi], [0 pi 2*pi], twopi); end
-title(P.ax(1), '(A) Forcing, $z=\pi$'); title(P.ax(2), '(B) Speed at $t=0.5$, $z=\pi$');
-P.colorbar(1, 'forcing magnitude $\|\mathbf{f}\|$'); P.colorbar(2, 'speed $\|\mathbf{u}\|$');
-P.save(fullfile(out, 'fastol_fields_forced_turb'));
+% ---- forced turbulence: (A) forcing magnitude, (B) speed at t = 0.5, on three faces of the box
+forced_figure(F.forced, out);
+end
+
+% ------------------------------------------------------------------ 3D benchmarks
+function species_figure(Sp, Me, out)
+S = fastol_plot_style();
+sp = @(u) sqrt(sum(u.^2, 2));
+R = 0.01; L = 0.26;
+fig = figure('Units', 'centimeters', 'Position', [2 2 17 7.6], 'Color', 'w', 'Visible', 'off');
+% (A) inlet velocity on the inlet faces of the mesh (exact geometry), colour by nearest sample
+a = axes(fig, 'Units', 'centimeters', 'Position', [1.3 2.6 4.2 4.2]); hold(a, 'on');
+inlet = [Me.markers.inlet_gas; Me.markers.inlet_air];
+c = (Me.nodes(inlet(:, 1), 1:2) + Me.nodes(inlet(:, 2), 1:2) + Me.nodes(inlet(:, 3), 1:2) + Me.nodes(inlet(:, 4), 1:2))/4;
+cv = Sp.inlet(knnsearch(Sp.bc_points(:, 1:2), c));
+patch(a, 'Faces', inlet, 'Vertices', Me.nodes(:, 1:2), 'FaceVertexCData', cv, 'FaceColor', 'flat', 'EdgeColor', 'none');
+t = linspace(0, 2*pi, 400); plot(a, R*cos(t), R*sin(t), 'k-', 'LineWidth', 0.5);
+axis(a, 'equal'); set(a, 'XLim', 1.05*[-R R], 'YLim', 1.05*[-R R], 'XTick', [-R 0 R], 'YTick', [-R 0 R]);
+colormap(a, parula(256)); clim(a, [min(cv) max(cv)]);
+xlabel(a, '$x$'); ylabel(a, '$y$'); title(a, '(A) Inlet velocity, $z=0$');
+finish_field_axes(a);
+cb = colorbar(a, 'southoutside'); cb_style(cb, S, 'inlet velocity');
+cb.Units = 'centimeters'; cb.Position = [1.7 1.15 3.4 0.22];
+% (B) speed at t = 0.5 on the plane x = 0. The samples are interpolated by natural neighbours
+% (no overshoot across the blades); plotted with the axis z horizontal and the transverse
+% direction expanded threefold.
+b = axes(fig, 'Units', 'centimeters', 'Position', [6.4 1.9 10.3 5.2]); hold(b, 'on');
+um = sp(Sp.u);
+I = scatteredInterpolant(Sp.points, um, 'natural', 'nearest');
+[z, y] = meshgrid(linspace(0, L, 1200), linspace(-R, R, 140));
+v = reshape(I(zeros(numel(z), 1), y(:), z(:)), size(z));
+surf(b, z, zeros(size(z)), y, v, 'EdgeColor', 'none');               % plot axes: (z, x, y)
+plot3(b, zeros(size(t)), R*cos(t), R*sin(t), 'k-', 'LineWidth', 0.4);   % outline of the pipe
+plot3(b, L*ones(size(t)), R*cos(t), R*sin(t), 'k-', 'LineWidth', 0.4);
+for s = [-1 1]
+    plot3(b, [0 L], [0 0], s*[R R], 'k-', 'LineWidth', 0.4);
+end
+colormap(b, parula(256)); clim(b, [0 max(um)]); shading(b, 'interp');
+daspect(b, [3 1 1]); view(b, [-28 22]); axis(b, 'tight'); axis(b, 'off');
+text(b, L/2, 0, -1.9*R, '$z$', 'Interpreter', 'latex', 'FontSize', S.label, 'HorizontalAlignment', 'center');
+title(b, '(B) Speed at $t=0.5$', 'FontWeight', 'normal', 'FontSize', S.label, 'Interpreter', 'latex');
+cb = colorbar(b, 'southoutside'); cb_style(cb, S, 'speed $\|\mathbf{u}\|$');
+cb.Units = 'centimeters'; cb.Position = [8.9 1.15 5.6 0.22];
+export_fig(fig, fullfile(out, 'fastol_fields_species_transport'), '-pdf', '-opengl', '-r600');
+close(fig); fprintf('wrote %s.pdf\n', fullfile(out, 'fastol_fields_species_transport'));
+end
+
+function forced_figure(Ft, out)
+S = fastol_plot_style();
+sp = @(u) sqrt(sum(u.^2, 2));
+Lp = 2*pi;
+[pp, idx] = periodic_images(Ft.points, Lp, 6*Lp/32);
+n = 160; g = linspace(0, Lp, n); [G1, G2] = meshgrid(g, g);
+faces = {[zeros(n*n, 1) G1(:) G2(:)], [G1(:) zeros(n*n, 1) G2(:)], [G1(:) G2(:) Lp*ones(n*n, 1)]};
+fig = figure('Units', 'centimeters', 'Position', [2 2 15 7.8], 'Color', 'w', 'Visible', 'off');
+vals = {sp(Ft.f), sp(Ft.u)};
+names = {'(A) Forcing', '(B) Speed at $t=0.5$'};
+labels = {'forcing magnitude $\|\mathbf{f}\|$', 'speed $\|\mathbf{u}\|$'};
+comp = {Ft.f, Ft.u};
+for k = 1:2
+    a = axes(fig, 'Units', 'centimeters', 'Position', [0.9 + (k-1)*7.3, 2.2, 5.9, 5.0]); hold(a, 'on');
+    for fq = 1:3
+        q = faces{fq}; U = zeros(size(q, 1), 3);
+        for c = 1:3, U(:, c) = phs_local(pp, comp{k}(idx, c), q, 30); end
+        V = reshape(sp(U), n, n);
+        Q = reshape(q, n, n, 3);
+        surf(a, Q(:, :, 1), Q(:, :, 2), Q(:, :, 3), V, 'EdgeColor', 'none');
+    end
+    e = [0 Lp];                                   % edges of the box
+    for i = e, for j = e
+        plot3(a, [0 Lp], [i i], [j j], 'k-', 'LineWidth', 0.4);
+        plot3(a, [i i], [0 Lp], [j j], 'k-', 'LineWidth', 0.4);
+        plot3(a, [i i], [j j], [0 Lp], 'k-', 'LineWidth', 0.4);
+    end, end
+    colormap(a, parula(256)); clim(a, [0 max(vals{k})]); shading(a, 'interp');
+    daspect(a, [1 1 1]); view(a, [-35 25]); axis(a, 'tight'); axis(a, 'off');
+    title(a, names{k}, 'FontWeight', 'normal', 'FontSize', S.label, 'Interpreter', 'latex');
+    cb = colorbar(a, 'southoutside'); cb_style(cb, S, labels{k});
+    cb.Units = 'centimeters'; cb.Position = [1.8 + (k-1)*7.3, 1.15, 4.2, 0.22];
+end
+export_fig(fig, fullfile(out, 'fastol_fields_forced_turb'), '-pdf', '-opengl', '-r600');
+close(fig); fprintf('wrote %s.pdf\n', fullfile(out, 'fastol_fields_forced_turb'));
+end
+
+function cb_style(cb, S, label)
+cb.TickLabelInterpreter = 'latex'; cb.FontSize = S.font; cb.LineWidth = 0.5;
+cb.Label.Interpreter = 'latex'; cb.Label.String = label; cb.Label.FontSize = S.label;
+end
+
+function v = phs_local(p, f, q, k)
+% Local cubic PHS + linear polynomial interpolation of the samples (p, f) at the points q,
+% on the k nearest samples of each point (the same kind of basis as the paper's local reconstruction).
+d = size(p, 2); nq = size(q, 1); v = zeros(nq, 1); chunk = 8000;
+for s = 1:chunk:nq
+    e = min(nq, s + chunk - 1); qq = q(s:e, :); m = e - s + 1;
+    id = knnsearch(p, qq, 'K', k);
+    X = reshape(p(id', :), k, m, d);                       % k x m x d
+    X = permute(X, [1 3 2]) - permute(qq, [3 2 1]);        % k x d x m, centred at the query
+    h = max(sqrt(sum(X.^2, 2)), [], 1); X = X./h;          % scale each stencil to unit radius
+    D = sqrt(sum((permute(X, [1 4 2 3]) - permute(X, [4 1 2 3])).^2, 3));  % k x k x 1 x m
+    Phi = reshape(D, k, k, m).^3;
+    P = cat(2, ones(k, 1, m), X);                          % k x (d+1) x m
+    A = cat(1, cat(2, Phi, P), cat(2, permute(P, [2 1 3]), zeros(d + 1, d + 1, m)));
+    rhs = cat(1, reshape(f(id'), k, 1, m), zeros(d + 1, 1, m));
+    c = pagemldivide(A, rhs);
+    r3 = reshape(sqrt(sum(X.^2, 2)).^3, k, 1, m);           % kernel at the query (origin)
+    v(s:e) = reshape(sum(c(1:k, 1, :).*r3, 1) + c(k + 1, 1, :), m, 1);
+end
 end
 
 % ------------------------------------------------------------------ helpers
@@ -161,41 +235,6 @@ set(a, 'FontSize', S.font, 'LineWidth', S.axlw, 'Box', 'on', 'TickLabelInterpret
     'Layer', 'top', 'TickDir', 'in', 'TickLength', [0.015 0.015]);
 a.XLabel.FontSize = S.label; a.YLabel.FontSize = S.label;
 a.Title.FontSize = S.label; a.Title.FontWeight = 'normal';
-end
-
-function T = hex_to_tet(H, k)
-% split each hexahedron (SU2/VTK ordering: bottom 1-4, top 5-8) into the five tetrahedra k
-T = zeros(5*size(H, 1), 4);
-for j = 1:5, T(j:5:end, :) = H(:, k(j, :)); end
-end
-
-function m = section_mask(Me, z, y)
-% grid points (0, y_i, z_j) inside the hexahedral mesh. Each hexahedron crossing x = 0 is split
-% into tetrahedra in both alternating five-tetrahedron ways (the mixer hexahedra are twisted, so
-% one split alone leaves slivers), and grid points in a tetrahedron's (z, y) bounding box are
-% tested barycentrically. Isolated pixels with at least 6 of 8 inside neighbours are then filled.
-m = false(numel(y), numel(z));
-k1 = [1 2 4 5; 2 3 4 7; 2 5 6 7; 4 5 7 8; 2 4 5 7];
-k2 = [1 2 3 6; 1 3 4 8; 1 6 5 8; 3 6 7 8; 1 3 6 8];
-for K = {k1, k2}
-    Tt = hex_to_tet(Me.hex, K{1}); nt = size(Tt, 1);
-    X = reshape(Me.nodes(Tt', 1), 4, nt); Tt = Tt(min(X) <= 0 & max(X) >= 0, :);
-    for e = 1:size(Tt, 1)
-        v = Me.nodes(Tt(e, :), :);                  % 4 x 3, columns x y z
-        jz = find(z >= min(v(:, 3)) - 1e-12 & z <= max(v(:, 3)) + 1e-12);
-        iy = find(y >= min(v(:, 2)) - 1e-12 & y <= max(v(:, 2)) + 1e-12);
-        if isempty(jz) || isempty(iy), continue; end
-        [J, I] = meshgrid(jz, iy);
-        q = [zeros(numel(I), 1) y(I(:))' z(J(:))'];
-        A = [v(2, :) - v(1, :); v(3, :) - v(1, :); v(4, :) - v(1, :)]';
-        if abs(det(A)) < eps*max(abs(A(:)))^3, continue; end
-        l = A \ (q - v(1, :))';
-        in = all(l >= -1e-10, 1) & sum(l, 1) <= 1 + 1e-10;
-        m(sub2ind(size(m), I(in), J(in))) = true;
-    end
-end
-n = conv2(double(m), [1 1 1; 1 0 1; 1 1 1], 'same');
-m = m | n >= 6;
 end
 
 function [pp, idx] = periodic_images(p, Lp, w)
